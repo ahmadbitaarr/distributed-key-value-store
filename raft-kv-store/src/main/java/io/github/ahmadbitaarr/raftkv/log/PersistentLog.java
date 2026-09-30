@@ -1,10 +1,11 @@
 package io.github.ahmadbitaarr.raftkv.log;
 
+import java.io.IOException;
 import java.util.List;
 import java.util.Optional;
 
 public interface PersistentLog {
-    void append(LogEntry entry);
+    void append(LogEntry entry) throws IOException;
 
     Optional<LogEntry> get(long index);
 
@@ -15,10 +16,11 @@ public interface PersistentLog {
     /**
      * Structurally removes every log entry with an index greater than {@code index}.
      *
-     * <p>This Phase 2 abstraction has no commit semantics. Callers in later phases
-     * are responsible for ensuring truncation does not remove committed entries.</p>
+     * <p>This logical abstraction does not decide whether a truncation is allowed by
+     * distributed commit policy. Durable implementations may reject a rewrite that
+     * would produce internally contradictory stored metadata.</p>
      *
      * @param index index of the final entry to retain; zero clears the entire log
      */
-    void truncateAfter(long index);
+    void truncateAfter(long index) throws IOException;
 }

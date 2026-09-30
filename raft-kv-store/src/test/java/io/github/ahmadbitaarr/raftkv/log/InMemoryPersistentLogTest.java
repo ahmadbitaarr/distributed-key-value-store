@@ -12,14 +12,14 @@ class InMemoryPersistentLogTest {
 
     @Test
     void emptyLogReportsLastLogIndexZero() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
 
         assertEquals(0, log.lastLogIndex());
     }
 
     @Test
     void firstAppendUsesIndexOne() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
         LogEntry entry = entry(1, "one");
 
         log.append(entry);
@@ -30,7 +30,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void appendsSequentialEntries() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
 
         log.append(entry(1, "one"));
         log.append(entry(2, "two"));
@@ -41,14 +41,14 @@ class InMemoryPersistentLogTest {
 
     @Test
     void looksUpEntryByIndex() {
-        PersistentLog log = logWithEntries(4);
+        InMemoryPersistentLog log = logWithEntries(4);
 
         assertEquals(entry(2, "entry-2"), log.get(2).orElseThrow());
     }
 
     @Test
     void missingFutureIndexReturnsEmpty() {
-        PersistentLog log = logWithEntries(3);
+        InMemoryPersistentLog log = logWithEntries(3);
 
         assertTrue(log.get(4).isEmpty());
         assertTrue(log.get(Long.MAX_VALUE).isEmpty());
@@ -56,7 +56,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void rejectsNonPositiveLookupIndex() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
 
         assertThrows(IllegalArgumentException.class, () -> log.get(0));
         assertThrows(IllegalArgumentException.class, () -> log.get(-1));
@@ -64,7 +64,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void retrievesOrderedRange() {
-        PersistentLog log = logWithEntries(5);
+        InMemoryPersistentLog log = logWithEntries(5);
 
         List<LogEntry> range = log.getRange(2, 4);
 
@@ -76,14 +76,14 @@ class InMemoryPersistentLogTest {
 
     @Test
     void retrievesSingleEntryRange() {
-        PersistentLog log = logWithEntries(3);
+        InMemoryPersistentLog log = logWithEntries(3);
 
         assertEquals(List.of(entry(3, "entry-3")), log.getRange(3, 3));
     }
 
     @Test
     void returnedRangeCannotModifyLog() {
-        PersistentLog log = logWithEntries(3);
+        InMemoryPersistentLog log = logWithEntries(3);
         List<LogEntry> range = log.getRange(1, 3);
 
         assertThrows(UnsupportedOperationException.class, () -> range.remove(0));
@@ -93,7 +93,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void rejectsIndexGap() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
         log.append(entry(1, "one"));
 
         assertThrows(IllegalArgumentException.class,
@@ -102,7 +102,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void rejectsDuplicateIndex() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
         log.append(entry(1, "one"));
 
         assertThrows(IllegalArgumentException.class,
@@ -111,7 +111,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void rejectsOutOfOrderIndex() {
-        PersistentLog log = logWithEntries(3);
+        InMemoryPersistentLog log = logWithEntries(3);
 
         assertThrows(IllegalArgumentException.class,
                 () -> log.append(entry(2, "two-again")));
@@ -119,14 +119,14 @@ class InMemoryPersistentLogTest {
 
     @Test
     void rejectsNullEntry() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
 
         assertThrows(NullPointerException.class, () -> log.append(null));
     }
 
     @Test
     void rejectsInvalidRangeIndexes() {
-        PersistentLog log = logWithEntries(3);
+        InMemoryPersistentLog log = logWithEntries(3);
 
         assertThrows(IllegalArgumentException.class, () -> log.getRange(0, 1));
         assertThrows(IllegalArgumentException.class, () -> log.getRange(-1, 1));
@@ -136,21 +136,21 @@ class InMemoryPersistentLogTest {
 
     @Test
     void rejectsReversedRange() {
-        PersistentLog log = logWithEntries(4);
+        InMemoryPersistentLog log = logWithEntries(4);
 
         assertThrows(IllegalArgumentException.class, () -> log.getRange(4, 2));
     }
 
     @Test
     void rejectsRangeBeyondLastLogIndex() {
-        PersistentLog log = logWithEntries(3);
+        InMemoryPersistentLog log = logWithEntries(3);
 
         assertThrows(IllegalArgumentException.class, () -> log.getRange(2, 4));
     }
 
     @Test
     void truncatesSuffix() {
-        PersistentLog log = logWithEntries(5);
+        InMemoryPersistentLog log = logWithEntries(5);
         LogEntry first = log.get(1).orElseThrow();
         LogEntry second = log.get(2).orElseThrow();
         LogEntry third = log.get(3).orElseThrow();
@@ -167,7 +167,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void truncateAtLastIndexIsNoOp() {
-        PersistentLog log = logWithEntries(3);
+        InMemoryPersistentLog log = logWithEntries(3);
         List<LogEntry> before = log.getRange(1, 3);
 
         log.truncateAfter(3);
@@ -178,7 +178,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void truncateBeyondLastIndexIsNoOp() {
-        PersistentLog log = logWithEntries(3);
+        InMemoryPersistentLog log = logWithEntries(3);
         List<LogEntry> before = log.getRange(1, 3);
 
         log.truncateAfter(10);
@@ -189,7 +189,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void truncateEmptyLogIsNoOp() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
 
         log.truncateAfter(0);
         log.truncateAfter(10);
@@ -199,7 +199,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void truncateToZeroClearsLog() {
-        PersistentLog log = logWithEntries(3);
+        InMemoryPersistentLog log = logWithEntries(3);
 
         log.truncateAfter(0);
 
@@ -211,14 +211,14 @@ class InMemoryPersistentLogTest {
 
     @Test
     void rejectsNegativeTruncationIndex() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
 
         assertThrows(IllegalArgumentException.class, () -> log.truncateAfter(-1));
     }
 
     @Test
     void appendsCorrectlyAfterTruncation() {
-        PersistentLog log = logWithEntries(4);
+        InMemoryPersistentLog log = logWithEntries(4);
         LogEntry replacement = entry(3, "replacement-three");
 
         log.truncateAfter(2);
@@ -230,7 +230,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void rejectsGapAfterTruncation() {
-        PersistentLog log = logWithEntries(4);
+        InMemoryPersistentLog log = logWithEntries(4);
 
         log.truncateAfter(2);
 
@@ -240,7 +240,7 @@ class InMemoryPersistentLogTest {
 
     @Test
     void lastLogIndexTracksTruncationCorrectly() {
-        PersistentLog log = new InMemoryPersistentLog();
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
         assertEquals(0, log.lastLogIndex());
 
         log.append(entry(1, "one"));
@@ -259,8 +259,8 @@ class InMemoryPersistentLogTest {
         assertEquals(2, log.lastLogIndex());
     }
 
-    private static PersistentLog logWithEntries(int count) {
-        PersistentLog log = new InMemoryPersistentLog();
+    private static InMemoryPersistentLog logWithEntries(int count) {
+        InMemoryPersistentLog log = new InMemoryPersistentLog();
         for (int index = 1; index <= count; index++) {
             log.append(entry(index, "entry-" + index));
         }
