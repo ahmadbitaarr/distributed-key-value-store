@@ -1,0 +1,93 @@
+syntax = "proto3";
+package raftkv.replication.v1;
+option java_package = "io.github.ahmadbitaarr.raftkv.rpc.generated.replication.v1";
+option java_multiple_files = true;
+option java_outer_classname = "ReplicationApiProto";
+
+enum OperationType {
+  OPERATION_TYPE_UNSPECIFIED = 0;
+  OPERATION_TYPE_PUT = 1;
+  OPERATION_TYPE_DELETE = 2;
+}
+
+enum NodeRole {
+  NODE_ROLE_UNSPECIFIED = 0;
+  NODE_ROLE_LEADER = 1;
+  NODE_ROLE_FOLLOWER = 2;
+}
+
+enum ReplicationRejectReason {
+  REPLICATION_REJECT_REASON_UNSPECIFIED = 0;
+  REPLICATION_REJECT_REASON_INDEX_GAP = 1;
+  REPLICATION_REJECT_REASON_INDEX_CONFLICT = 2;
+  REPLICATION_REJECT_REASON_NOT_READY = 3;
+}
+
+message LogEntry {
+  int64 index = 1;
+  string request_id = 2;
+  OperationType operation = 3;
+  string key = 4;
+  optional bytes value = 5;
+  bytes command_fingerprint = 6;
+}
+
+message ReplicateEntryRequest {
+  string leader_id = 1;
+  LogEntry entry = 2;
+  int64 leader_commit_index = 3;
+}
+
+// accepted=true is a FUTURE durable WAL acknowledgment, not merely receipt or validation.
+// This phase does not implement a follower service.
+message ReplicateEntryResponse {
+  string follower_id = 1;
+  bool accepted = 2;
+  int64 last_persisted_index = 3;
+  int64 commit_index = 4;
+  string message = 5;
+  optional int64 expected_next_index = 6;
+  ReplicationRejectReason reject_reason = 7;
+}
+
+message AdvanceCommitRequest {
+  string leader_id = 1;
+  int64 commit_index = 2;
+}
+
+message AdvanceCommitResponse {
+  string follower_id = 1;
+  int64 commit_index = 2;
+  int64 applied_index = 3;
+}
+
+message ReplicationStatusRequest {
+  string leader_id = 1;
+}
+
+message ReplicationStatusResponse {
+  string node_id = 1;
+  NodeRole role = 2;
+  int64 last_log_index = 3;
+  int64 commit_index = 4;
+  int64 applied_index = 5;
+  bool ready = 6;
+}
+
+message TruncateSuffixRequest {
+  string leader_id = 1;
+  int64 truncate_after_index = 2;
+}
+
+message TruncateSuffixResponse {
+  string node_id = 1;
+  int64 last_log_index = 2;
+  int64 commit_index = 3;
+}
+
+service ReplicationService {
+  rpc ReplicateEntry(ReplicateEntryRequest) returns (ReplicateEntryResponse);
+  rpc AdvanceCommit(AdvanceCommitRequest) returns (AdvanceCommitResponse);
+  rpc GetReplicationStatus(ReplicationStatusRequest) returns (ReplicationStatusResponse);
+  rpc TruncateUncommittedSuffix(TruncateSuffixRequest) returns (TruncateSuffixResponse);
+}
