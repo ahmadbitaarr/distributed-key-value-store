@@ -7,6 +7,7 @@ import java.io.IOException;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import java.util.function.LongSupplier;
 
 /** Explicit delivery of already-durable entries; never commits, counts quorum or retries. */
 public final class ReplicationManager implements AutoCloseable {
@@ -14,6 +15,7 @@ public final class ReplicationManager implements AutoCloseable {
     private final WalBackedPersistentLog leaderLog;
     private final FollowerClient client;
     private final long waitMillis;
+    private final LongSupplier nanoClock;
     private final ExecutorService workers;
     private final Map<String, Peer> peers = new ConcurrentHashMap<>();
     private volatile boolean closed;
@@ -33,6 +35,12 @@ public final class ReplicationManager implements AutoCloseable {
     /** Test/harness attempt budget; the RPC also carries its own bounded deadline. */
     public ReplicationManager(ClusterConfig config, WalBackedPersistentLog leaderLog,
             FollowerClient client, long waitMillis) {
+        this(config,leaderLog,client,waitMillis,System::nanoTime);
+    }
+    /** Package-private monotonic clock seam for deterministic deadline-race tests. */
+    ReplicationManager(ClusterConfig config, WalBackedPersistentLog leaderLog,
+            FollowerClient client, long waitMillis, LongSupplier nanoClock) {
+        this.nanoClock=Objects.requireNonNull(nanoClock,"nanoClock");
         this.config=Objects.requireNonNull(config);
         this.leaderLog=Objects.requireNonNull(leaderLog);
         this.client=Objects.requireNonNull(client);
@@ -58,6 +66,13 @@ public final class ReplicationManager implements AutoCloseable {
     }
 
     private Submission submit(String followerId, LogEntry entry) {
+        return submit(followerId, entry, null);
+    }
+
+    private record Completion(String followerId, FollowerClient.Outcome outcome) { }
+
+    private Submission submit(String followerId, LogEntry entry,
+            java.util.function.Consumer<Completion> completed) {
         long index=entry.index();
         Peer peer=peers.get(followerId);
         if(peer==null) throw new IllegalArgumentException("unknown follower");
@@ -66,23 +81,27 @@ public final class ReplicationManager implements AutoCloseable {
             return new Submission(new FollowerClient.Outcome(FollowerClient.Kind.BUSY,index,0,0,"follower attempt active"),null);
         try {
             Future<FollowerClient.Outcome> future=workers.submit(()->{
+                FollowerClient.Outcome result;
                 try {
-                    FollowerClient.Outcome result=client.replicate(followerId,entry);
+                    result=client.replicate(followerId,entry);
                     if(result==null || result.requestedIndex()!=index || result.kind()==null)
-                        return new FollowerClient.Outcome(FollowerClient.Kind.INVALID_RESPONSE,index,0,0,"bad client outcome");
+                        result=new FollowerClient.Outcome(FollowerClient.Kind.INVALID_RESPONSE,index,0,0,"bad client outcome");
                     if(result.kind()==FollowerClient.Kind.ACK) {
                         if(result.lastReportedPersistedIndex()<index)
-                            return new FollowerClient.Outcome(FollowerClient.Kind.INVALID_RESPONSE,index,0,0,"ACK does not cover entry");
-                        peer.acceptedRequestIndex.accumulateAndGet(index,Math::max);
-                        peer.reportedPersistedIndex.accumulateAndGet(result.lastReportedPersistedIndex(),Math::max);
+                            result=new FollowerClient.Outcome(FollowerClient.Kind.INVALID_RESPONSE,index,0,0,"ACK does not cover entry");
+                        else {
+                            peer.acceptedRequestIndex.accumulateAndGet(index,Math::max);
+                            peer.reportedPersistedIndex.accumulateAndGet(result.lastReportedPersistedIndex(),Math::max);
+                        }
                     }
-                    return result;
                 } catch(RuntimeException e) {
-                    return new FollowerClient.Outcome(FollowerClient.Kind.REMOTE_ERROR,index,0,0,
+                    result=new FollowerClient.Outcome(FollowerClient.Kind.REMOTE_ERROR,index,0,0,
                             "worker exception: "+e.getClass().getSimpleName());
                 } finally {
-                    peer.active.set(false); // actual worker exit, not future cancellation or timeout
+                    peer.active.set(false); // only actual worker exit releases ownership
                 }
+                if(completed!=null) completed.accept(new Completion(followerId,result));
+                return result;
             });
             return new Submission(null,future);
         } catch (RejectedExecutionException rejected) {
@@ -120,6 +139,51 @@ public final class ReplicationManager implements AutoCloseable {
         Map<String,FollowerClient.Outcome> answers=new LinkedHashMap<>();
         pending.forEach((id,submission)->answers.put(id,await(submission,index)));
         return new BatchResult(answers);
+    }
+
+    /**
+     * Phase 7 bounded fanout using a SINGLE decision deadline. Completions are consumed
+     * in finish order so a slow follower cannot hide an earlier healthy ACK.
+     * Late completions update Phase 6 diagnostic progress only, never this batch result.
+     */
+    public BatchResult replicateStoredEntryUntil(long index, long deadlineNanos) {
+        LogEntry entry=requireStoredEntry(index);
+        BlockingQueue<Completion> completed=new LinkedBlockingQueue<>();
+        Map<String,FollowerClient.Outcome> results=new LinkedHashMap<>();
+        Set<String> pending=new TreeSet<>();
+        for(String id:new TreeSet<>(peers.keySet())) {
+            Submission submission=submit(id,entry,completed::offer);
+            if(submission.immediate()!=null) results.put(id,submission.immediate());
+            else pending.add(id);
+        }
+        while(!pending.isEmpty()) {
+            long remaining=deadlineNanos-nanoClock.getAsLong();
+            if(remaining<=0)break;
+            Completion done;
+            try {
+                done=completed.poll(remaining,TimeUnit.NANOSECONDS);
+            } catch(InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+            if(done==null)break;
+            // A completion dequeued after the deadline is not a timely durability proof.
+            // Checking only before poll() races a worker that finishes at the deadline.
+            long observedAtNanos=nanoClock.getAsLong();
+            if(pending.remove(done.followerId())) {
+                results.put(done.followerId(),observedAtNanos>=deadlineNanos
+                        ? decisionTimeout(index) : done.outcome());
+            }
+            if(observedAtNanos>=deadlineNanos)break;
+        }
+        for(String id:pending)
+            results.put(id,decisionTimeout(index));
+        return new BatchResult(results);
+    }
+
+    private static FollowerClient.Outcome decisionTimeout(long index) {
+        return new FollowerClient.Outcome(FollowerClient.Kind.UNKNOWN_TIMEOUT,index,0,0,
+                "no confirmed outcome before coordinator decision deadline");
     }
 
     public long highestAcceptedRequestIndex(String id) { return requirePeer(id).acceptedRequestIndex.get(); }

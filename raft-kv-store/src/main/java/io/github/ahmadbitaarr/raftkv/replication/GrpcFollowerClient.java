@@ -10,12 +10,13 @@ import io.github.ahmadbitaarr.raftkv.rpc.generated.replication.v1.*;
 import java.io.IOException;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 
 /** Bounded, single-request gRPC client; no retries and no assumption timeout means absent. */
-public final class GrpcFollowerClient implements FollowerClient {
+public final class GrpcFollowerClient implements FollowerClient, FollowerStatusProbe {
     private final ClusterConfig config;
     private final Function<String, NodeEndpoint> endpointResolver;
     private final Map<String, ManagedChannel> channels=new ConcurrentHashMap<>();
@@ -81,6 +82,41 @@ public final class GrpcFollowerClient implements FollowerClient {
             return new Outcome(kind,entry.index(),0,0,rpc.getStatus().getCode().name());
         } catch (RuntimeException unexpected) {
             return new Outcome(Kind.REMOTE_ERROR,entry.index(),0,0,unexpected.getClass().getSimpleName());
+        }
+    }
+
+    /** Fresh-follower bootstrap probe on the SAME lifecycle-owned channel as replication. */
+    @Override public Optional<FollowerStatusProbe.Status> probeStatus(String followerId) {
+        if (followerId == null || followerId.equals(config.configuredLeaderId())
+                || !config.members().containsKey(followerId))
+            throw new IllegalArgumentException("unconfigured follower target");
+        try {
+            ManagedChannel channel;
+            synchronized (lifecycleLock) {
+                if (closed) return Optional.empty();
+                channel = channels.computeIfAbsent(followerId, id -> {
+                    NodeEndpoint endpoint = Objects.requireNonNull(endpointResolver.apply(id), "configured endpoint");
+                    return ManagedChannelBuilder.forAddress(endpoint.host(), endpoint.port()).usePlaintext()
+                            .maxInboundMessageSize(config.maxInboundMessageBytes()).build();
+                });
+            }
+            var request = ReplicationStatusRequest.newBuilder()
+                    .setLeaderId(config.configuredLeaderId()).build();
+            ReplicationContractValidator.validate(request);
+            var response = ReplicationServiceGrpc.newBlockingStub(channel)
+                    .withDeadlineAfter(config.statusDeadlineMs(), TimeUnit.MILLISECONDS)
+                    .getReplicationStatus(request);
+            ReplicationContractValidator.validate(response);
+            if (!followerId.equals(response.getNodeId())
+                    || response.getRole() != io.github.ahmadbitaarr.raftkv.rpc.generated.replication.v1.NodeRole.NODE_ROLE_FOLLOWER)
+                return Optional.empty();
+            return Optional.of(new FollowerStatusProbe.Status(followerId,
+                    io.github.ahmadbitaarr.raftkv.server.NodeRole.FOLLOWER,
+                    response.getLastLogIndex(), response.getCommitIndex(),
+                    response.getAppliedIndex(), response.getReady()));
+        } catch (io.grpc.StatusRuntimeException | IllegalArgumentException failure) {
+            // Unavailable, invalid or unauthenticated metadata can never bootstrap prefix zero.
+            return Optional.empty();
         }
     }
 

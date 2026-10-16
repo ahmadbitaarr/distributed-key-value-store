@@ -25,7 +25,20 @@ class NodeLoopbackGrpcTest {
  @Test void followerLoopbackClientGetReturnsNotLeader()throws Exception{try(var n=node("n2")){var c=channel(n.boundPort());try{assertEquals(ResultCode.RESULT_CODE_NOT_LEADER,client(c).get(GetRequest.newBuilder().setKey("x").build()).getCode());}finally{c.shutdownNow();}}}
  @Test void leaderLoopbackClientGetReturnsNotReadyWithCommittedWal()throws Exception{try(var store=FileWalStore.open(dir.resolve("raftkv.wal"))){store.appendEntryDurably(new LogEntry(1,"r",Command.put("x",new byte[]{1}),new byte[]{2}));store.appendCommitDurably(1);}try(var n=node("n1")){var c=channel(n.boundPort());try{assertEquals(ResultCode.RESULT_CODE_NOT_READY,client(c).get(GetRequest.newBuilder().setKey("x").build()).getCode());}finally{c.shutdownNow();}}}
  @Test void loopbackReplicationStatusIsValidAndNotReady()throws Exception{try(var n=node("n2")){var c=channel(n.boundPort());try{var x=peer(c).getReplicationStatus(ReplicationStatusRequest.newBuilder().setLeaderId("n1").build());assertFalse(x.getReady());assertEquals(0,x.getAppliedIndex());}finally{c.shutdownNow();}}}
- @Test void loopbackLargePutOverFourMiBReachesHandler()throws Exception{try(var n=node("n1")){var c=channel(n.boundPort());try{var request=PutRequest.newBuilder().setRequestId("r").setKey("k").setValue(ByteString.copyFrom(new byte[5*1024*1024])).build();assertEquals(ResultCode.RESULT_CODE_NOT_READY,client(c).put(request).getCode());}finally{c.shutdownNow();}}}
+ @Test void loopbackLargePutOverFourMiBReachesHandler()throws Exception{
+  try(var n=node("n1")){
+   var c=channel(n.boundPort());
+   try{
+    var request=PutRequest.newBuilder().setRequestId("r").setKey("k")
+     .setValue(ByteString.copyFrom(new byte[5*1024*1024])).build();
+    // The 5 MiB request reaches Phase 7's mutation handler; no follower is running.
+    var response=client(c).put(request);
+    assertEquals(ResultCode.RESULT_CODE_NO_QUORUM,response.getCode());
+    assertEquals("r",response.getRequestId());
+    assertFalse(response.hasCommitIndex());
+   }finally{c.shutdownNow();}
+  }
+ }
  @Test void loopbackPutOverApplicationEightMiBLimitIsInvalidArgument()throws Exception{try(var n=node("n1")){var c=channel(n.boundPort());try{var request=PutRequest.newBuilder().setRequestId("r").setKey("k").setValue(ByteString.copyFrom(new byte[RpcLimits.MAX_VALUE_BYTES+1])).build();assertEquals(Status.Code.INVALID_ARGUMENT,assertThrows(StatusRuntimeException.class,()->client(c).put(request)).getStatus().getCode());}finally{c.shutdownNow();}}}
  @Test void loopbackMessageOverTwelveMiBRejectedAtTransport()throws Exception{try(var n=node("n1")){var c=channel(n.boundPort());try{var request=PutRequest.newBuilder().setRequestId("r").setKey("k").setValue(ByteString.copyFrom(new byte[RpcLimits.MAX_SERIALIZED_MESSAGE_BYTES+1024])).build();var ex=assertThrows(StatusRuntimeException.class,()->client(c).put(request));assertEquals(Status.Code.RESOURCE_EXHAUSTED,ex.getStatus().getCode());}finally{c.shutdownNow();}}}
  @Test void loopbackTestOnlyLargeResponseHonorsClientInboundLimit()throws Exception{
