@@ -41,6 +41,7 @@ public final class LeaderCoordinator {
     private final AtomicReference<IOException> storageFault=new AtomicReference<>();
     private final boolean freshAtStartup;
     private volatile boolean unresolvedSuffix;
+    private volatile Runnable committedWakeup=()->{};
 
     public LeaderCoordinator(ClusterConfig config, WalBackedPersistentLog log, WalStore wal,
             ReplicationManager replication, FollowerStatusProbe probe, AckTracker tracker,
@@ -68,6 +69,9 @@ public final class LeaderCoordinator {
         return gate.awaitDrained(timeout,unit);
     }
 
+    /** A catch-up wake-up is advisory and cannot affect an already finalized client mutation. */
+    public void setCommitWakeup(Runnable listener){committedWakeup=Objects.requireNonNull(listener);}
+
     public MutationResult mutate(String requestId, Command command) throws IOException {
         Objects.requireNonNull(requestId,"requestId");Objects.requireNonNull(command,"command");
         var permit=gate.tryAcquire();
@@ -75,17 +79,32 @@ public final class LeaderCoordinator {
         try(permit) {
             if(storageFault.get()!=null || unresolvedSuffix || admittedIds.contains(requestId))
                 return new MutationResult(Code.NOT_READY,0);
-            // Explicit joint network decision deadline: at most two bounded status probes
-            // plus one concurrent replication fanout. A late ACK never reopens this decision.
-            long networkDeadline=System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(
-                    2L*config.statusDeadlineMs()+config.replicationDeadlineMs()+250L);
+            // Bound fresh-prefix probes independently of any pre-append reservation wait.
+            // Local catch-up slot contention must not consume the post-ENTRY ACK budget.
+            long probeDeadline=System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(
+                    2L*config.statusDeadlineMs());
             // Probe only previously unknown followers. Nonempty/unavailable history NEVER implies prefix zero.
             for(String follower:config.members().keySet()) {
-                if(System.nanoTime()>=networkDeadline)break;
+                if(System.nanoTime()>=probeDeadline)break;
                 if(follower.equals(config.configuredLeaderId()) || tracker.verifiedMatchingThrough(follower)>=0)continue;
                 try {probe.probeStatus(follower).ifPresent(status -> tracker.certifyEmpty(follower,status));}
                 catch(RuntimeException peerUnavailable) { /* unknown is not a quorum certificate */ }
             }
+            ReplicationManager.LiveReservation liveReservation;
+            try {
+                long committedPrefix=wal.durableCommitIndex();
+                liveReservation=replication.reserveLivePriority(config.replicationDeadlineMs()+250L,
+                        id -> tracker.verifiedMatchingThrough(id)>=committedPrefix);
+            } catch(InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                return new MutationResult(Code.NOT_READY,0);
+            }
+            if(liveReservation==null)return new MutationResult(Code.NOT_READY,0);
+            try(liveReservation) {
+            // Fresh bounded replication decision starts only after the pre-append
+            // reservation is obtained. A late ACK cannot change this deadline.
+            long networkDeadline=System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(
+                    config.replicationDeadlineMs()+250L);
             boolean localEntryDurable=false;
             try {
                 long previous=log.lastLogIndex();
@@ -101,7 +120,8 @@ public final class LeaderCoordinator {
                 publishDurableIndex.accept(next);
 
                 // One global budget for both follower attempts; slow peer cannot obstruct fast peer.
-                ReplicationManager.BatchResult outcomes=replication.replicateStoredEntryUntil(next,networkDeadline);
+                ReplicationManager.BatchResult outcomes=replication.replicateStoredEntryForLiveWrite(next,
+                        networkDeadline,id -> tracker.verifiedMatchingThrough(id)>=next-1);
                 for(var accepted:outcomes.outcomes().entrySet()) {
                     tracker.recordDurableAck(accepted.getKey(),entry,accepted.getValue());
                 }
@@ -114,6 +134,7 @@ public final class LeaderCoordinator {
                 long applied=applier.applyThrough(next,wal.durableCommitIndex(),log);
                 if(applied<next)throw new IllegalStateException("committed entry not applied");
                 publishAppliedIndex.accept(applied);
+                try { committedWakeup.run(); } catch(RuntimeException ignored) { /* advisory only */ }
                 return new MutationResult(Code.OK,next);
             } catch(IOException failure) {
                 latchFatal(failure);throw failure;
@@ -125,6 +146,7 @@ public final class LeaderCoordinator {
                 if(unexpected instanceof Error fatalError)throw fatalError;
                 throw failure;
             }
+            } // live replication priority reservation
         }
     }
 

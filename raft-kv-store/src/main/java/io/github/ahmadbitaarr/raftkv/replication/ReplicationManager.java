@@ -19,6 +19,56 @@ public final class ReplicationManager implements AutoCloseable {
     private final ExecutorService workers;
     private final Map<String, Peer> peers = new ConcurrentHashMap<>();
     private volatile boolean closed;
+    private final Object arbitration=new Object();
+    private boolean livePriority;
+
+    /** Reserve priority BEFORE leader ENTRY force, so background contention fails as NOT_READY. */
+    public LiveReservation reserveLivePriority(long maxWaitMillis) throws InterruptedException {
+        return reserveLivePriority(maxWaitMillis,id->true);
+    }
+
+    /** Defer before local append if background owns the only verified matching-prefix peer. */
+    public LiveReservation reserveLivePriority(long maxWaitMillis,java.util.function.Predicate<String> certifiedPeer)
+            throws InterruptedException {
+        Objects.requireNonNull(certifiedPeer);
+        if(maxWaitMillis<0)throw new IllegalArgumentException("negative reservation wait");
+        synchronized(arbitration) {
+            if(closed || livePriority)return null;
+            livePriority=true; // atomic with every background slot acquisition
+            long deadline=System.nanoTime()+TimeUnit.MILLISECONDS.toNanos(maxWaitMillis);
+            // A free peer can support quorum even while the other has a slow catch-up RPC.
+            while(!closed && (peers.values().stream().allMatch(peer -> peer.active.get())
+                    || (peers.keySet().stream().anyMatch(certifiedPeer)
+                        && peers.entrySet().stream().noneMatch(e -> certifiedPeer.test(e.getKey())
+                                && !e.getValue().active.get())))) {
+                long remaining=deadline-System.nanoTime();
+                if(remaining<=0) {livePriority=false;arbitration.notifyAll();return null;}
+                TimeUnit.NANOSECONDS.timedWait(arbitration,remaining);
+            }
+            if(closed){livePriority=false;arbitration.notifyAll();return null;}
+            return new LiveReservation();
+        }
+    }
+    public final class LiveReservation implements AutoCloseable {
+        private boolean released;
+        @Override public void close(){synchronized(arbitration){if(!released){released=true;livePriority=false;arbitration.notifyAll();}}}
+    }
+
+    /** One background RPC at a time per follower, yielding at every RPC boundary. */
+    public <T> Optional<T> backgroundAttempt(String follower, Callable<T> operation) {
+        Objects.requireNonNull(operation);
+        Peer peer=requirePeer(follower);
+        synchronized(arbitration) {
+            if(closed || livePriority || !peer.active.compareAndSet(false,true))return Optional.empty();
+        }
+        try {
+            return Optional.ofNullable(operation.call());
+        }catch(Exception failure){return Optional.empty();}
+        finally {
+            synchronized(arbitration){peer.active.set(false);arbitration.notifyAll();}
+        }
+    }
+
 
     public record BatchResult(Map<String,FollowerClient.Outcome> outcomes) {
         public BatchResult { outcomes=Map.copyOf(outcomes); }
@@ -98,14 +148,17 @@ public final class ReplicationManager implements AutoCloseable {
                     result=new FollowerClient.Outcome(FollowerClient.Kind.REMOTE_ERROR,index,0,0,
                             "worker exception: "+e.getClass().getSimpleName());
                 } finally {
-                    peer.active.set(false); // only actual worker exit releases ownership
+                    synchronized(arbitration) {
+                        peer.active.set(false); // only actual worker exit releases ownership
+                        arbitration.notifyAll();
+                    }
                 }
                 if(completed!=null) completed.accept(new Completion(followerId,result));
                 return result;
             });
             return new Submission(null,future);
         } catch (RejectedExecutionException rejected) {
-            peer.active.set(false);
+            synchronized(arbitration){peer.active.set(false);arbitration.notifyAll();}
             return new Submission(new FollowerClient.Outcome(FollowerClient.Kind.REMOTE_ERROR,index,0,0,
                     "executor rejected attempt"),null);
         }
@@ -147,37 +200,65 @@ public final class ReplicationManager implements AutoCloseable {
      * Late completions update Phase 6 diagnostic progress only, never this batch result.
      */
     public BatchResult replicateStoredEntryUntil(long index, long deadlineNanos) {
+        return replicateUntil(index,deadlineNanos,id->false,false);
+    }
+
+    /** Live requests can retry a locally BUSY background slot before the SAME decision deadline.
+     * A timely ACK from a previously certified prefix is already a sufficient follower vote. */
+    public BatchResult replicateStoredEntryForLiveWrite(long index,long deadlineNanos,
+            java.util.function.Predicate<String> certifiedPrefix) {
+        return replicateUntil(index,deadlineNanos,Objects.requireNonNull(certifiedPrefix),true);
+    }
+
+    private BatchResult replicateUntil(long index,long deadlineNanos,
+            java.util.function.Predicate<String> certifiedPrefix,boolean retryBackgroundBusy) {
         LogEntry entry=requireStoredEntry(index);
         BlockingQueue<Completion> completed=new LinkedBlockingQueue<>();
         Map<String,FollowerClient.Outcome> results=new LinkedHashMap<>();
         Set<String> pending=new TreeSet<>();
+        Set<String> retryBusy=new TreeSet<>();
         for(String id:new TreeSet<>(peers.keySet())) {
             Submission submission=submit(id,entry,completed::offer);
-            if(submission.immediate()!=null) results.put(id,submission.immediate());
-            else pending.add(id);
+            if(submission.immediate()!=null) {
+                if(retryBackgroundBusy && submission.immediate().kind()==FollowerClient.Kind.BUSY)
+                    retryBusy.add(id);
+                else results.put(id,submission.immediate());
+            } else pending.add(id);
         }
-        while(!pending.isEmpty()) {
+        while(!pending.isEmpty() || !retryBusy.isEmpty()) {
             long remaining=deadlineNanos-nanoClock.getAsLong();
             if(remaining<=0)break;
+            for(var it=retryBusy.iterator();it.hasNext();) {
+                String id=it.next();
+                if(peers.get(id).active.get())continue;
+                Submission submission=submit(id,entry,completed::offer);
+                if(submission.immediate()==null){pending.add(id);it.remove();}
+                else if(submission.immediate().kind()!=FollowerClient.Kind.BUSY){
+                    results.put(id,submission.immediate());it.remove();
+                }
+            }
+            if(pending.isEmpty() && retryBusy.isEmpty())break;
             Completion done;
             try {
-                done=completed.poll(remaining,TimeUnit.NANOSECONDS);
+                long boundedPoll=retryBusy.isEmpty()?remaining:
+                        Math.min(remaining,TimeUnit.MILLISECONDS.toNanos(25));
+                done=completed.poll(boundedPoll,TimeUnit.NANOSECONDS);
             } catch(InterruptedException interrupted) {
-                Thread.currentThread().interrupt();
-                break;
+                Thread.currentThread().interrupt();break;
             }
-            if(done==null)break;
-            // A completion dequeued after the deadline is not a timely durability proof.
-            // Checking only before poll() races a worker that finishes at the deadline.
+            if(done==null){if(retryBusy.isEmpty())break;else continue;}
+            // A completion dequeued at or after the deadline never supplies proof.
             long observedAtNanos=nanoClock.getAsLong();
             if(pending.remove(done.followerId())) {
-                results.put(done.followerId(),observedAtNanos>=deadlineNanos
-                        ? decisionTimeout(index) : done.outcome());
+                var answer=observedAtNanos>=deadlineNanos?decisionTimeout(index):done.outcome();
+                results.put(done.followerId(),answer);
+                if(retryBackgroundBusy && answer.kind()==FollowerClient.Kind.ACK
+                        && certifiedPrefix.test(done.followerId()))break;
             }
             if(observedAtNanos>=deadlineNanos)break;
         }
-        for(String id:pending)
-            results.put(id,decisionTimeout(index));
+        for(String id:pending)results.put(id,decisionTimeout(index));
+        for(String id:retryBusy)results.put(id,decisionTimeout(index));
         return new BatchResult(results);
     }
 
@@ -194,7 +275,7 @@ public final class ReplicationManager implements AutoCloseable {
     }
 
     @Override public synchronized void close() throws IOException {
-        closed=true;
+        synchronized(arbitration){closed=true;livePriority=false;arbitration.notifyAll();}
         workers.shutdown(); // Never assume cancel(true) means worker exit.
         try {
             boolean terminated=workers.awaitTermination(config.shutdownGraceMs(),TimeUnit.MILLISECONDS);

@@ -6,6 +6,7 @@ import io.github.ahmadbitaarr.raftkv.log.LogEntry;
 import io.github.ahmadbitaarr.raftkv.log.WalBackedPersistentLog;
 import io.github.ahmadbitaarr.raftkv.server.NodeStatusSnapshot;
 import io.github.ahmadbitaarr.raftkv.wal.WalStore;
+import io.github.ahmadbitaarr.raftkv.statemachine.StateMachineApplier;
 import java.io.IOException;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
@@ -26,17 +27,30 @@ public final class FollowerReplicationHandler {
     private final Supplier<NodeStatusSnapshot> status;
     private final Consumer<Long> publishDurableIndex;
     private final Consumer<IOException> fatal;
+    private final StateMachineApplier applier;
+    private final Consumer<Long> publishCommitIndex;
+    private final Consumer<Long> publishAppliedIndex;
     private final AtomicReference<IOException> firstFailure = new AtomicReference<>();
 
     public FollowerReplicationHandler(ClusterConfig config, WalBackedPersistentLog log, WalStore store,
             ReplicationOperationGate gate, Supplier<NodeStatusSnapshot> status,
             Consumer<Long> publishDurableIndex, Consumer<IOException> fatal) {
+        this(config,log,store,gate,status,publishDurableIndex,null,ignored->{},ignored->{},fatal);
+    }
+
+    /** Phase 9 follower-only commit/application ownership; original constructor remains compatible. */
+    public FollowerReplicationHandler(ClusterConfig config, WalBackedPersistentLog log, WalStore store,
+            ReplicationOperationGate gate, Supplier<NodeStatusSnapshot> status,
+            Consumer<Long> publishDurableIndex, StateMachineApplier applier,
+            Consumer<Long> publishCommitIndex, Consumer<Long> publishAppliedIndex, Consumer<IOException> fatal) {
         this.config=Objects.requireNonNull(config);
-        if (config.localRole()!=NodeRole.FOLLOWER)
-            throw new IllegalArgumentException("only configured followers may construct replication handler");
-        this.log=Objects.requireNonNull(log); this.store=Objects.requireNonNull(store);
-        this.gate=Objects.requireNonNull(gate); this.status=Objects.requireNonNull(status);
+        if(config.localRole()!=NodeRole.FOLLOWER)throw new IllegalArgumentException("follower only");
+        this.log=Objects.requireNonNull(log);this.store=Objects.requireNonNull(store);
+        this.gate=Objects.requireNonNull(gate);this.status=Objects.requireNonNull(status);
         this.publishDurableIndex=Objects.requireNonNull(publishDurableIndex);
+        this.applier=applier;
+        this.publishCommitIndex=Objects.requireNonNull(publishCommitIndex);
+        this.publishAppliedIndex=Objects.requireNonNull(publishAppliedIndex);
         this.fatal=Objects.requireNonNull(fatal);
     }
 
@@ -84,6 +98,89 @@ public final class FollowerReplicationHandler {
 
             }
         }
+    }
+
+    public record CommitDecision(long commitIndex, long appliedIndex) { }
+    public record TruncateDecision(long lastLogIndex, long commitIndex) { }
+
+    /** Shared writer + operation permit covers force, ordered apply and coherent publication. */
+    public CommitDecision advanceCommit(String leaderId,long target) throws IOException {
+        requireLeader(leaderId);
+        if(target<0)throw new IllegalArgumentException("negative commit index");
+        if(firstFailure.get()!=null)throw new StorageFailedException(firstFailure.get());
+        var permit=gate.tryAcquire();
+        if(permit==null)throw new ProtocolRejectedException("follower replication admission closed");
+        try(permit) {
+            synchronized(writer) {
+                requireAvailable();
+                if(applier==null)throw new ProtocolRejectedException("commit application not configured");
+                if(target>log.lastLogIndex())throw new ProtocolRejectedException("commit beyond durable last index");
+                if(target<store.durableCommitIndex())throw new ProtocolRejectedException("commit regression");
+                try {
+                    if(target>store.durableCommitIndex()) {
+                        store.appendCommitDurably(target); // force(true) precedes any publication or application
+                        publishCommitIndex.accept(store.durableCommitIndex());
+                    }
+                    long applied=applier.applyThrough(target,store.durableCommitIndex(),log);
+                    publishAppliedIndex.accept(applied);
+                    return new CommitDecision(store.durableCommitIndex(),applied);
+                } catch(IOException failure) {
+                    latchFatal(failure);throw failure;
+                } catch(RuntimeException | Error failure) {
+                    IOException unsafe=new IOException("follower commit/application outcome unsafe",failure);
+                    latchFatal(unsafe);
+                    if(failure instanceof Error fatalError)throw fatalError;
+                    throw unsafe;
+                }
+            }
+        }
+    }
+
+    /** Truncation is only of an uncommitted suffix; leader verifies the retained prefix. */
+    public TruncateDecision truncateUncommittedSuffix(String leaderId,long retainThrough) throws IOException {
+        requireLeader(leaderId);
+        if(retainThrough<0)throw new IllegalArgumentException("negative retained index");
+        if(firstFailure.get()!=null)throw new StorageFailedException(firstFailure.get());
+        var permit=gate.tryAcquire();
+        if(permit==null)throw new ProtocolRejectedException("follower replication admission closed");
+        try(permit) {
+            synchronized(writer) {
+                requireAvailable();
+                long committed=store.durableCommitIndex();
+                if(retainThrough<committed || (applier!=null && retainThrough<applier.appliedIndex()))
+                    throw new ProtocolRejectedException("cannot truncate committed or applied prefix");
+                if(retainThrough>log.lastLogIndex())
+                    throw new ProtocolRejectedException("retained index exceeds stored prefix");
+                try {
+                    if(retainThrough<log.lastLogIndex()) {
+                        log.truncateAfter(retainThrough); // WAL durable rewrite and recovery first
+                        publishDurableIndex.accept(log.lastLogIndex());
+                    }
+                    return new TruncateDecision(log.lastLogIndex(),store.durableCommitIndex());
+                } catch(IOException failure) {
+                    latchFatal(failure);throw failure;
+                } catch(RuntimeException | Error failure) {
+                    IOException unsafe=new IOException("follower WAL rewrite outcome unsafe",failure);
+                    latchFatal(unsafe);
+                    if(failure instanceof Error fatalError)throw fatalError;
+                    throw unsafe;
+                }
+            }
+        }
+    }
+
+    private void requireLeader(String id) {
+        if(!config.configuredLeaderId().equals(id))throw new UnrecognizedLeaderException();
+    }
+
+    private void requireAvailable() throws IOException {
+        if(firstFailure.get()!=null)throw new StorageFailedException(firstFailure.get());
+        if(status.get().state()!=io.github.ahmadbitaarr.raftkv.server.NodeLifecycleState.CONTROL_ONLY)
+            throw new ProtocolRejectedException("follower not available for replication");
+    }
+
+    public static final class ProtocolRejectedException extends RuntimeException {
+        public ProtocolRejectedException(String message){super(message);}
     }
 
     private void latchFatal(IOException error) {

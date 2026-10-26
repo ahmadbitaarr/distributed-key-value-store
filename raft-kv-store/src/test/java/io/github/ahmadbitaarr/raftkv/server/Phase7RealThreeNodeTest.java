@@ -4,6 +4,9 @@ import com.google.protobuf.ByteString;
 import io.grpc.*;
 import io.github.ahmadbitaarr.raftkv.config.*;
 import io.github.ahmadbitaarr.raftkv.leader.CanonicalCommandFingerprint;
+import io.github.ahmadbitaarr.raftkv.rpc.ProtoMapper;
+import io.github.ahmadbitaarr.raftkv.rpc.generated.replication.v1.ReplicateEntryRequest;
+import io.github.ahmadbitaarr.raftkv.rpc.generated.replication.v1.ReplicationServiceGrpc;
 import io.github.ahmadbitaarr.raftkv.log.*;
 import io.github.ahmadbitaarr.raftkv.replication.GrpcFollowerClientTestSupport;
 import io.github.ahmadbitaarr.raftkv.rpc.generated.client.v1.*;
@@ -56,7 +59,7 @@ class Phase7RealThreeNodeTest {
 
     @Test void realHealthyThreeNodePutDeleteAndOrderedApplication() throws Exception {
         var c1=config("n1");var c2=config("n2");var c3=config("n3");
-        var live=new HashMap<String,NodeEndpoint>();
+        var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var n2=follower(c2);var n3=follower(c3);var leader=leader(c1,live)) {
             n2.start();register(live,"n2",n2);
             n3.start();register(live,"n3",n3);
@@ -68,8 +71,13 @@ class Phase7RealThreeNodeTest {
                 assertEquals(1,created.getCommitIndex());
                 assertEquals(1,leader.statusSnapshot().durableCommitIndex());
                 assertEquals(1,leader.statusSnapshot().appliedIndex());
-                assertEquals(0,n2.statusSnapshot().durableCommitIndex());
-                assertEquals(0,n3.statusSnapshot().appliedIndex());
+                // Phase 9 asynchronously propagates follower COMMIT and application.
+                long followerDeadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);
+                while ((n2.statusSnapshot().appliedIndex()!=1 || n3.statusSnapshot().appliedIndex()!=1)
+                        && System.nanoTime()<followerDeadline) Thread.sleep(20);
+                assertEquals(1,n2.statusSnapshot().durableCommitIndex());
+                assertEquals(1,n2.statusSnapshot().appliedIndex());
+                assertEquals(1,n3.statusSnapshot().appliedIndex());
                 var deleted=delete(ch,"d2","key");
                 assertEquals(ResultCode.RESULT_CODE_OK,deleted.getCode());
                 assertEquals(2,deleted.getCommitIndex());
@@ -89,7 +97,7 @@ class Phase7RealThreeNodeTest {
     }
 
     @Test void oneHealthyFollowerCanCommitWithoutTheOther() throws Exception {
-        var c1=config("n1");var c2=config("n2");var live=new HashMap<String,NodeEndpoint>();
+        var c1=config("n1");var c2=config("n2");var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var n2=follower(c2);var leader=leader(c1,live)) {
             n2.start();register(live,"n2",n2);leader.start();
             var ch=channel(leader);
@@ -98,13 +106,17 @@ class Phase7RealThreeNodeTest {
                 assertEquals(ResultCode.RESULT_CODE_OK,response.getCode());
                 assertEquals(1,leader.statusSnapshot().durableCommitIndex());
                 assertEquals(1,n2.statusSnapshot().lastLogIndex());
-                assertEquals(0,n2.statusSnapshot().durableCommitIndex());
+                long followerDeadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(8);
+                while(n2.statusSnapshot().durableCommitIndex()!=1 && System.nanoTime()<followerDeadline)
+                    Thread.sleep(20);
+                assertEquals(1,n2.statusSnapshot().durableCommitIndex());
+                assertEquals(1,n2.statusSnapshot().appliedIndex());
             } finally {ch.shutdownNow();}
         }
     }
 
     @Test void durableSecondEntryCannotRegressAppliedIndexAfterFirstCommit() throws Exception {
-        var c1=config("n1");var c2=config("n2");var live=new HashMap<String,NodeEndpoint>();
+        var c1=config("n1");var c2=config("n2");var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var n2=follower(c2);var leader=leader(c1,live)) {
             n2.start();register(live,"n2",n2);leader.start();
             var ch=channel(leader);
@@ -144,7 +156,7 @@ class Phase7RealThreeNodeTest {
     }
 
     @Test void neitherFollowerAvailableReturnsNoQuorumAndFreezesFutureWrites() throws Exception {
-        var live=new HashMap<String,NodeEndpoint>();
+        var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var leader=leader(config("n1"),live)) {
             leader.start();var ch=channel(leader);
             try {
@@ -159,22 +171,84 @@ class Phase7RealThreeNodeTest {
     }
 
     @Test void sameIndexAckOnUnverifiedHistoryIsNotProofOfMatchingPrefix() throws Exception {
-        var c1=config("n1");var c2=config("n2");var live=new HashMap<String,NodeEndpoint>();
-        var command=Command.put("x",new byte[]{1});
-        var prior=new LogEntry(1,"same-id",command,CanonicalCommandFingerprint.of(command));
-        try(var seeded=FileWalStore.open(c2.walFile())){seeded.appendEntryDurably(prior);}
-        try(var n2=follower(c2);var leader=leader(c1,live)) {
-            n2.start();register(live,"n2",n2);leader.start();var ch=channel(leader);
+        // Phase 9 is allowed to verify a nonempty follower by replaying exact entries.
+        // At index 1 a validated prefix-zero start plus an exact duplicate ACK is
+        // sufficient proof. The safety case must therefore use index 2 with an
+        // actually divergent, COMMITTED index 1 that can never be reconciled.
+        var c1=config("n1");var c2=config("n2");var c3=config("n3");
+        var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
+        var divergentCommand=Command.put("different-history",new byte[]{9});
+        var divergentFirst=new LogEntry(1,"other-history",divergentCommand,
+                CanonicalCommandFingerprint.of(divergentCommand));
+        var secondCommand=Command.put("x",new byte[]{1});
+        var matchingSecond=new LogEntry(2,"same-id",secondCommand,
+                CanonicalCommandFingerprint.of(secondCommand));
+        try(var seeded=FileWalStore.open(c2.walFile())) {
+            seeded.appendEntryDurably(divergentFirst);
+            seeded.appendEntryDurably(matchingSecond);
+            seeded.appendCommitDurably(1); // a committed conflict must never be rewritten
+        }
+        try(var n2=follower(c2);var n3=follower(c3);var leader=leader(c1,live)) {
+            n2.start();register(live,"n2",n2);
+            n3.start();register(live,"n3",n3);
+            leader.start();var ch=channel(leader);
             try {
-                assertEquals(ResultCode.RESULT_CODE_NO_QUORUM,put(ch,"same-id","x",new byte[]{1}).getCode());
-                assertEquals(0,leader.statusSnapshot().durableCommitIndex());
-                assertEquals(1,n2.statusSnapshot().lastLogIndex());
+                // Commit leader index 1 with n3, not the divergent n2.
+                assertEquals(ResultCode.RESULT_CODE_OK,
+                        put(ch,"leader-first","correct-history",new byte[]{7}).getCode());
+                assertEquals(1,leader.statusSnapshot().durableCommitIndex());
+                assertEquals(1,n2.statusSnapshot().durableCommitIndex());
+
+                // Remove the only follower with a verified matching prefix.
+                n3.close();live.remove("n3");
+
+                // n2 already holds EXACTLY the future leader entry at index 2.
+                // The leader must reject that same-index ACK as quorum evidence
+                // because the committed predecessor at index 1 is divergent.
+                assertEquals(ResultCode.RESULT_CODE_NO_QUORUM,
+                        put(ch,"same-id","x",new byte[]{1}).getCode(),
+                        "index-2 duplicate ACK without matching index 1 cannot form a majority");
+
+                // After the leader ENTRY(2) is durable, prove using real gRPC
+                // that n2 can positively ACK this exact duplicate at index 2.
+                // This late verification must not retroactively create a COMMIT.
+                var n2Channel=channel(n2);
+                try {
+                    var duplicate=ReplicationServiceGrpc.newBlockingStub(n2Channel)
+                            .withDeadlineAfter(4,TimeUnit.SECONDS)
+                            .replicateEntry(ReplicateEntryRequest.newBuilder()
+                                    .setLeaderId("n1")
+                                    .setEntry(ProtoMapper.toProtoLogEntry(matchingSecond))
+                                    .setLeaderCommitIndex(1).build());
+                    assertTrue(duplicate.getAccepted(),"exact index-2 retransmission is a durable ACK");
+                    assertEquals("n2",duplicate.getFollowerId());
+                    assertEquals(2,duplicate.getLastPersistedIndex());
+                } finally {n2Channel.shutdownNow();}
+
+                assertEquals(2,leader.statusSnapshot().lastLogIndex());
+                assertEquals(1,leader.statusSnapshot().durableCommitIndex());
+                assertEquals(1,leader.statusSnapshot().appliedIndex());
+                assertEquals(2,n2.statusSnapshot().lastLogIndex());
+                assertEquals(1,n2.statusSnapshot().durableCommitIndex());
+                assertEquals(ResultCode.RESULT_CODE_NOT_READY,
+                        put(ch,"blocked-third","x",new byte[]{3}).getCode(),
+                        "unresolved suffix must remain blocked despite duplicate ACK");
             } finally {ch.shutdownNow();}
+        }
+        // Confirm that background catch-up never destroyed the incompatible committed prefix.
+        try(var leaderWal=FileWalStore.open(c1.walFile());
+            var followerWal=FileWalStore.open(c2.walFile())) {
+            assertEquals(2,leaderWal.lastDurableLogIndex());
+            assertEquals(1,leaderWal.durableCommitIndex());
+            assertEquals(2,followerWal.lastDurableLogIndex());
+            assertEquals(1,followerWal.durableCommitIndex());
+            assertEquals(divergentFirst,followerWal.recoveryResult().entries().get(0));
+            assertEquals(matchingSecond,followerWal.recoveryResult().entries().get(1));
         }
     }
 
     @Test void recoveredCommittedLeaderCannotResumeWritingWithoutPhase10() throws Exception {
-        var c1=config("n1");var c2=config("n2");var live=new HashMap<String,NodeEndpoint>();
+        var c1=config("n1");var c2=config("n2");var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var n2=follower(c2);var leader=leader(c1,live)) {
             n2.start();register(live,"n2",n2);leader.start();var ch=channel(leader);
             try {assertEquals(ResultCode.RESULT_CODE_OK,put(ch,"first","x",new byte[]{1}).getCode());}

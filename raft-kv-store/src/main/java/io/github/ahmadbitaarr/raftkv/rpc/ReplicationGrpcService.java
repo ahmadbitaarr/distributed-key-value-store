@@ -12,7 +12,7 @@ import io.github.ahmadbitaarr.raftkv.wal.WalCorruptionException;
 import io.github.ahmadbitaarr.raftkv.replication.FollowerReplicationHandler;
 import java.util.function.Supplier;
 
-/** Phase 5 diagnostics and truthful non-ACKs. Does not mutate any WAL. */
+/** Follower replication, forced COMMIT/application and guarded suffix rewrite; callback-safe RPC mapping. */
 public final class ReplicationGrpcService extends ReplicationServiceGrpc.ReplicationServiceImplBase {
     private final ClusterConfig config;
     private final Supplier<NodeStatusSnapshot> snapshot;
@@ -78,19 +78,30 @@ public final class ReplicationGrpcService extends ReplicationServiceGrpc.Replica
         observer.onCompleted();
     }
     @Override public void advanceCommit(AdvanceCommitRequest request,StreamObserver<AdvanceCommitResponse> observer){
-        io.grpc.StatusRuntimeException rejection;
+        AdvanceCommitResponse response;
         try {
             ReplicationContractValidator.validate(request);
             requireConfiguredLeader(request.getLeaderId());
-            rejection=Status.FAILED_PRECONDITION.withDescription("commit advancement disabled until later phase").asRuntimeException();
-        } catch (IllegalArgumentException | NullPointerException e) {
-            rejection=Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException();
-        } catch (io.grpc.StatusRuntimeException e) {
-            rejection=e;
-        }
-        // Observer callbacks must not be inside the validation/error-mapping try block.
-        observer.onError(rejection);
+            if(snapshot.get().role()!=NodeRole.FOLLOWER || handler==null)
+                throw Status.FAILED_PRECONDITION.withDescription("not an enabled follower").asRuntimeException();
+            var outcome=handler.advanceCommit(request.getLeaderId(),request.getCommitIndex());
+            response=AdvanceCommitResponse.newBuilder().setFollowerId(config.localNodeId())
+                    .setCommitIndex(outcome.commitIndex()).setAppliedIndex(outcome.appliedIndex()).build();
+            ReplicationContractValidator.validate(response);
+        } catch(IllegalArgumentException | NullPointerException e) {
+            observer.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());return;
+        } catch(io.grpc.StatusRuntimeException e) {observer.onError(e);return;
+        } catch(FollowerReplicationHandler.UnrecognizedLeaderException | FollowerReplicationHandler.ProtocolRejectedException e) {
+            observer.onError(Status.FAILED_PRECONDITION.withDescription(e.getMessage()).asRuntimeException());return;
+        } catch(FollowerReplicationHandler.StorageFailedException e) {
+            observer.onError(storageFailureStatus(e.getCause()));return;
+        } catch(WalCorruptionException e) {observer.onError(storageFailureStatus(e));return;
+        } catch(IOException e) {observer.onError(storageFailureStatus(e));return;
+        } catch(RuntimeException e) {observer.onError(Status.INTERNAL.withDescription("follower commit handler failed").asRuntimeException());return;}
+        observer.onNext(response);
+        observer.onCompleted();
     }
+
     @Override public void getReplicationStatus(ReplicationStatusRequest request,StreamObserver<ReplicationStatusResponse> observer){
         ReplicationStatusResponse response;
         try {
@@ -118,17 +129,37 @@ public final class ReplicationGrpcService extends ReplicationServiceGrpc.Replica
         observer.onCompleted();
     }
     @Override public void truncateUncommittedSuffix(TruncateSuffixRequest request,StreamObserver<TruncateSuffixResponse> observer){
-        io.grpc.StatusRuntimeException rejection;
+        TruncateSuffixResponse response;
         try {
             ReplicationContractValidator.validate(request);
             requireConfiguredLeader(request.getLeaderId());
-            rejection=Status.FAILED_PRECONDITION.withDescription("suffix truncation disabled until later phase").asRuntimeException();
-        } catch (IllegalArgumentException | NullPointerException e) {
-            rejection=Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException();
-        } catch (io.grpc.StatusRuntimeException e) {
-            rejection=e;
+            if(snapshot.get().role()!=NodeRole.FOLLOWER || handler==null)
+                throw Status.FAILED_PRECONDITION.withDescription("not an enabled follower").asRuntimeException();
+            var outcome=handler.truncateUncommittedSuffix(request.getLeaderId(),request.getTruncateAfterIndex());
+            response=TruncateSuffixResponse.newBuilder().setNodeId(config.localNodeId())
+                    .setLastLogIndex(outcome.lastLogIndex()).setCommitIndex(outcome.commitIndex()).build();
+            ReplicationContractValidator.validate(response);
+        } catch(IllegalArgumentException | NullPointerException e) {
+            observer.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());return;
+        } catch(io.grpc.StatusRuntimeException e) {observer.onError(e);return;
+        } catch(FollowerReplicationHandler.UnrecognizedLeaderException | FollowerReplicationHandler.ProtocolRejectedException e) {
+            observer.onError(Status.FAILED_PRECONDITION.withDescription(e.getMessage()).asRuntimeException());return;
+        } catch(FollowerReplicationHandler.StorageFailedException e) {observer.onError(storageFailureStatus(e.getCause()));return;
+        } catch(WalCorruptionException e) {observer.onError(storageFailureStatus(e));return;
+        } catch(IOException e) {observer.onError(storageFailureStatus(e));return;
+        } catch(RuntimeException e) {observer.onError(Status.INTERNAL.withDescription("follower rewrite handler failed").asRuntimeException());return;}
+        observer.onNext(response);
+        observer.onCompleted();
+    }
+
+    private static io.grpc.StatusRuntimeException storageFailureStatus(Throwable failure) {
+        Throwable cursor=failure;
+        while(cursor!=null) {
+            if(cursor instanceof WalCorruptionException)
+                return Status.DATA_LOSS.withDescription("confirmed follower WAL corruption; storage admission closed").asRuntimeException();
+            cursor=cursor.getCause();
         }
-        observer.onError(rejection);
+        return Status.INTERNAL.withDescription("follower durable storage operation failed; admission closed").asRuntimeException();
     }
     private void requireConfiguredLeader(String claimed){
         if(!config.configuredLeaderId().equals(claimed))

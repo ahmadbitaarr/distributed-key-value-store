@@ -9,6 +9,7 @@ import io.github.ahmadbitaarr.raftkv.replication.FollowerReplicationHandler;
 import io.github.ahmadbitaarr.raftkv.replication.ReplicationOperationGate;
 import io.github.ahmadbitaarr.raftkv.replication.GrpcFollowerClient;
 import io.github.ahmadbitaarr.raftkv.replication.ReplicationManager;
+import io.github.ahmadbitaarr.raftkv.replication.FollowerCatchUpCoordinator;
 import io.github.ahmadbitaarr.raftkv.commit.AckTracker;
 import io.github.ahmadbitaarr.raftkv.commit.CommitManager;
 import io.github.ahmadbitaarr.raftkv.leader.LeaderCoordinator;
@@ -24,7 +25,7 @@ import java.util.function.Consumer;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Single WAL owner; CONTROL_ONLY permits follower replication, never client data readiness. */
+/** Single WAL owner: leader READY, follower CONTROL_ONLY with durable catch-up and bounded cleanup. */
 public final class NodeServer implements AutoCloseable {
     @FunctionalInterface interface ServerFactory {
         Server build(ClusterConfig config,int port,ClientKvGrpcService client,ReplicationGrpcService replication);
@@ -37,7 +38,7 @@ public final class NodeServer implements AutoCloseable {
     private final int port;
     private final ServerFactory serverFactory;
     private final WalOpener walOpener;
-    private final Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory;
+    private final Function<ClusterConfig,? extends io.github.ahmadbitaarr.raftkv.replication.FollowerMaintenanceClient> outboundClientFactory;
     private final StartupBoundary startupBoundary;
     private final ReplicationOperationGate replicationGate=new ReplicationOperationGate();
     private final AtomicReference<NodeStatusSnapshot> published;
@@ -48,6 +49,8 @@ public final class NodeServer implements AutoCloseable {
     private ReplicationManager replicationManager;
     private LeaderCoordinator leaderCoordinator;
     private StateMachineApplier leaderApplier;
+    private StateMachineApplier followerApplier;
+    private FollowerCatchUpCoordinator leaderCatchUp;
     private LeaderReadCoordinator leaderReads;
 
     public NodeServer(ClusterConfig config){this(config,-1,NodeServer::buildNetty,FileWalStore::open);}
@@ -60,19 +63,19 @@ public final class NodeServer implements AutoCloseable {
     }
     /** Test-only seam: real Netty on port zero with resolved, already-bound peer endpoints. */
     NodeServer(ClusterConfig config,int testPortOverride,
-            Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory) {
+            Function<ClusterConfig,? extends io.github.ahmadbitaarr.raftkv.replication.FollowerMaintenanceClient> outboundClientFactory) {
         this(config,testPortOverride,NodeServer::buildNetty,FileWalStore::open,outboundClientFactory);
     }
     NodeServer(ClusterConfig config,int testPortOverride,
-            Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory,StartupBoundary startupBoundary) {
+            Function<ClusterConfig,? extends io.github.ahmadbitaarr.raftkv.replication.FollowerMaintenanceClient> outboundClientFactory,StartupBoundary startupBoundary) {
         this(config,testPortOverride,NodeServer::buildNetty,FileWalStore::open,outboundClientFactory,startupBoundary);
     }
     private NodeServer(ClusterConfig config,int testPortOverride,ServerFactory serverFactory,
-            WalOpener walOpener,Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory){
+            WalOpener walOpener,Function<ClusterConfig,? extends io.github.ahmadbitaarr.raftkv.replication.FollowerMaintenanceClient> outboundClientFactory){
         this(config,testPortOverride,serverFactory,walOpener,outboundClientFactory,(ignoredPort,ignoredFailure) -> {});
     }
     private NodeServer(ClusterConfig config,int testPortOverride,ServerFactory serverFactory,
-            WalOpener walOpener,Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory,
+            WalOpener walOpener,Function<ClusterConfig,? extends io.github.ahmadbitaarr.raftkv.replication.FollowerMaintenanceClient> outboundClientFactory,
             StartupBoundary startupBoundary){
         this.outboundClientFactory=Objects.requireNonNull(outboundClientFactory,"outboundClientFactory");
         this.startupBoundary=Objects.requireNonNull(startupBoundary,"startupBoundary");
@@ -89,6 +92,7 @@ public final class NodeServer implements AutoCloseable {
     LeaderReadCoordinator readCoordinatorForTest(){return leaderReads;}
     LeaderCoordinator leaderCoordinatorForTest(){return leaderCoordinator;}
     StateMachineApplier readApplierForTest(){return leaderApplier;}
+    StateMachineApplier followerApplierForTest(){return followerApplier;}
     public synchronized int boundPort(){return server!=null && !server.isShutdown()?server.getPort():-1;}
 
     public synchronized void start() throws IOException {
@@ -106,9 +110,20 @@ public final class NodeServer implements AutoCloseable {
                     && recovery.entries().isEmpty() && recovery.commitIndex()==0;
             published.set(new NodeStatusSnapshot(config.localNodeId(),config.localRole(),
                     NodeLifecycleState.RECOVERING,recovery.entries().size(),recovery.commitIndex(),0,false));
-            FollowerReplicationHandler follower=config.localRole()==NodeRole.FOLLOWER
-                ? new FollowerReplicationHandler(config,log,store,replicationGate,this::statusSnapshot,
-                        this::publishDurableIndex,this::recordFatalStorageFailure) : null;
+            // Phase 9 narrowly replays follower-only committed history before any RPC admission.
+            FollowerReplicationHandler follower=null;
+            if(config.localRole()==NodeRole.FOLLOWER) {
+                followerApplier=new StateMachineApplier(new KvStateMachine());
+                try {
+                    long restored=followerApplier.applyThrough(recovery.commitIndex(),recovery.commitIndex(),log);
+                    publishAppliedIndex(restored);
+                }catch(RuntimeException | Error invalidReplay) {
+                    throw new IOException("follower committed WAL replay failed; admission remains closed",invalidReplay);
+                }
+                follower=new FollowerReplicationHandler(config,log,store,replicationGate,this::statusSnapshot,
+                        this::publishDurableIndex,followerApplier,this::publishCommitIndex,
+                        this::publishAppliedIndex,this::recordFatalStorageFailure);
+            }
             if(config.localRole()==NodeRole.LEADER) {
                 var outgoing=Objects.requireNonNull(outboundClientFactory.apply(config),"outbound client");
                 replicationManager=new ReplicationManager(config,log,outgoing);
@@ -121,6 +136,9 @@ public final class NodeServer implements AutoCloseable {
                 leaderCoordinator=new LeaderCoordinator(config,log,store,replicationManager,outgoing,
                         tracker,committer,leaderApplier,this::publishDurableIndex,
                         this::publishAppliedIndex,this::recordFatalStorageFailure);
+                leaderCatchUp=new FollowerCatchUpCoordinator(config,log,this::statusSnapshot,replicationManager,
+                        outgoing,tracker,leaderCoordinator::hasUnresolvedSuffix);
+                leaderCoordinator.setCommitWakeup(leaderCatchUp::wake);
             }
             var client=new ClientKvGrpcService(config,this::statusSnapshot,leaderCoordinator,leaderReads);
             var peers=new ReplicationGrpcService(config,this::statusSnapshot,follower);
@@ -142,6 +160,8 @@ public final class NodeServer implements AutoCloseable {
                 // Recovered nonempty leaders retain their closed write gate.
                 leaderCoordinator.openAfterStartup();
                 requireHealthyLeaderStartup();
+                // Recovered leader stays CONTROL_ONLY: do not start catch-up without an authoritative state.
+                if(freshLeaderAtRecovery && leaderCatchUp!=null)leaderCatchUp.start();
             }
         }catch(IOException | RuntimeException failure){
             replicationGate.closeAdmission();
@@ -185,6 +205,8 @@ public final class NodeServer implements AutoCloseable {
     private void recordFatalStorageFailure(IOException failure){
         storageFault.compareAndSet(null,failure);
         if(leaderReads!=null)leaderReads.closeAdmission();
+        if(leaderCatchUp!=null)leaderCatchUp.closeAdmission();
+        replicationGate.closeAdmission();
         published.updateAndGet(old->{
             var state=old.state();
             if(state==NodeLifecycleState.STOPPING || state==NodeLifecycleState.STOPPED) return old;
@@ -206,6 +228,7 @@ public final class NodeServer implements AutoCloseable {
         if(statusSnapshot().state()==NodeLifecycleState.STOPPED)return;
         transition(NodeLifecycleState.STOPPING);
         if(leaderReads!=null)leaderReads.closeAdmission();
+        if(leaderCatchUp!=null)leaderCatchUp.closeAdmission();
         replicationGate.closeAdmission();
         if(leaderCoordinator!=null)leaderCoordinator.closeAdmission();
         releaseResourcesAfterTermination();
@@ -258,6 +281,10 @@ public final class NodeServer implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 throw new IOException("interrupted awaiting leader mutation completion; WAL lease retained",interrupted);
             }
+        }
+        if(leaderCatchUp!=null) {
+            leaderCatchUp.close(); // actual catch-up workers must exit before channels/WAL ownership ends
+            leaderCatchUp=null;
         }
         if(replicationManager!=null){
             replicationManager.close(); // bounded wait, preserves channels/WAL lease on failure

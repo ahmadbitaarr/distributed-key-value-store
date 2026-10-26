@@ -34,6 +34,24 @@ public final class AckTracker {
         return true;
     }
 
+    /** Nonempty status certifies only the mathematically empty prefix, never its reported entries. */
+    public synchronized boolean beginNonemptyVerification(String target, FollowerStatusProbe.Status status) {
+        requireFollower(target);
+        if(status==null || !target.equals(status.nodeId()) || status.role()!=NodeRole.FOLLOWER
+                || status.lastLogIndex()<=0 || status.commitIndex()>status.lastLogIndex()
+                || status.appliedIndex()>status.commitIndex()) return false;
+        invalidate(target);
+        verified.put(target,0L);
+        return true;
+    }
+
+    /** Invalidates all certificates relying on this follower's prior evidence. */
+    public synchronized void invalidate(String target) {
+        requireFollower(target);
+        verified.put(target,-1L);
+        issued.entrySet().removeIf(e -> e.getValue().voters().contains(target));
+    }
+
     public synchronized long verifiedMatchingThrough(String target) {requireFollower(target);return verified.get(target);}
 
     /** A validated outcome binds the exact requested leader entry to the next consecutive index. */

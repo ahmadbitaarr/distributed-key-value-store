@@ -94,13 +94,13 @@ public final class FileWalStore implements WalStore {
     }
 
     @Override
-    public WalRecoveryResult recoveryResult() {
+    public synchronized WalRecoveryResult recoveryResult() {
         ensureOpenUnchecked();
         return recoveryResult;
     }
 
     @Override
-    public void appendEntryDurably(LogEntry entry) throws IOException {
+    public synchronized void appendEntryDurably(LogEntry entry) throws IOException {
         ensureOpen();
         Objects.requireNonNull(entry, "entry must not be null");
         long expectedIndex = lastDurableLogIndex() + 1;
@@ -116,7 +116,7 @@ public final class FileWalStore implements WalStore {
     }
 
     @Override
-    public void appendCommitDurably(long commitIndex) throws IOException {
+    public synchronized void appendCommitDurably(long commitIndex) throws IOException {
         ensureOpen();
         if (commitIndex < 0) {
             throw new IllegalArgumentException("commitIndex must not be negative");
@@ -138,7 +138,7 @@ public final class FileWalStore implements WalStore {
     }
 
     @Override
-    public void rewriteDurably(List<LogEntry> retainedEntries, long commitIndex) throws IOException {
+    public synchronized void rewriteDurably(List<LogEntry> retainedEntries, long commitIndex) throws IOException {
         ensureOpen();
         Objects.requireNonNull(retainedEntries, "retainedEntries must not be null");
         List<LogEntry> canonicalEntries = List.copyOf(retainedEntries);
@@ -175,19 +175,19 @@ public final class FileWalStore implements WalStore {
     }
 
     @Override
-    public long lastDurableLogIndex() {
+    public synchronized long lastDurableLogIndex() {
         ensureOpenUnchecked();
         return durableEntries.size();
     }
 
     @Override
-    public long durableCommitIndex() {
+    public synchronized long durableCommitIndex() {
         ensureOpenUnchecked();
         return durableCommitIndex;
     }
 
     @Override
-    public void close() throws IOException {
+    public synchronized void close() throws IOException {
         if (closed) {
             return;
         }

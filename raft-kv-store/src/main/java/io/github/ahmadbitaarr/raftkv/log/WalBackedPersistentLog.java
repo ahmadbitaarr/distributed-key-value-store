@@ -26,7 +26,7 @@ public final class WalBackedPersistentLog implements PersistentLog, AutoCloseabl
     }
 
     @Override
-    public void append(LogEntry entry) throws IOException {
+    public synchronized void append(LogEntry entry) throws IOException {
         Objects.requireNonNull(entry, "entry must not be null");
         long expectedIndex = lastLogIndex() + 1;
         if (entry.index() != expectedIndex) {
@@ -42,7 +42,7 @@ public final class WalBackedPersistentLog implements PersistentLog, AutoCloseabl
     }
 
     @Override
-    public Optional<LogEntry> get(long index) {
+    public synchronized Optional<LogEntry> get(long index) {
         requirePositiveIndex(index, "index");
         if (index > lastLogIndex()) {
             return Optional.empty();
@@ -51,7 +51,7 @@ public final class WalBackedPersistentLog implements PersistentLog, AutoCloseabl
     }
 
     @Override
-    public List<LogEntry> getRange(long fromIndexInclusive, long toIndexInclusive) {
+    public synchronized List<LogEntry> getRange(long fromIndexInclusive, long toIndexInclusive) {
         requirePositiveIndex(fromIndexInclusive, "fromIndexInclusive");
         requirePositiveIndex(toIndexInclusive, "toIndexInclusive");
         if (fromIndexInclusive > toIndexInclusive) {
@@ -66,12 +66,12 @@ public final class WalBackedPersistentLog implements PersistentLog, AutoCloseabl
     }
 
     @Override
-    public long lastLogIndex() {
+    public synchronized long lastLogIndex() {
         return entries.size();
     }
 
     @Override
-    public void truncateAfter(long index) throws IOException {
+    public synchronized void truncateAfter(long index) throws IOException {
         if (index < 0) {
             throw new IllegalArgumentException("index must not be negative");
         }
@@ -86,6 +86,14 @@ public final class WalBackedPersistentLog implements PersistentLog, AutoCloseabl
         List<LogEntry> retained = List.copyOf(entries.subList(0, Math.toIntExact(index)));
         walStore.rewriteDurably(retained, walStore.durableCommitIndex());
         entries.subList(Math.toIntExact(index), entries.size()).clear();
+    }
+
+    /** Immutable bounded copy taken under the same writer lock; never hold it across network I/O. */
+    public synchronized List<LogEntry> snapshotRange(long first, long last, int maximumEntries) {
+        if(maximumEntries<1) throw new IllegalArgumentException("maximumEntries must be positive");
+        if(first<1 || last<first || last>lastLogIndex() || last-first+1>maximumEntries)
+            throw new IllegalArgumentException("invalid bounded snapshot range");
+        return getRange(first,last);
     }
 
     @Override

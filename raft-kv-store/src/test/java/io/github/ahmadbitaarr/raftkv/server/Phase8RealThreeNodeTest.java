@@ -66,7 +66,7 @@ class Phase8RealThreeNodeTest {
         }
     }
     @Test void threeNodePutOverwriteEmptyBinaryAndDeleteHaveCoherentReadIndexes() throws Exception {
-        var live=new HashMap<String,NodeEndpoint>();
+        var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var n2=follower(config("n2"));var n3=follower(config("n3"));var n1=leader(config("n1"),live)){
             n2.start();register(live,"n2",n2);n3.start();register(live,"n3",n3);n1.start();
             var c=channel(n1);var f=channel(n2);
@@ -99,7 +99,7 @@ class Phase8RealThreeNodeTest {
         }
     }
     @Test void oneFollowerSufficesForWriteAndRead() throws Exception {
-        var live=new HashMap<String,NodeEndpoint>();
+        var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var n2=follower(config("n2"));var n1=leader(config("n1"),live)) {
             n2.start();register(live,"n2",n2);n1.start();var c=channel(n1);
             try {
@@ -110,7 +110,7 @@ class Phase8RealThreeNodeTest {
         }
     }
     @Test void unresolvedSecondWriteDoesNotObscureLastCommittedValue() throws Exception {
-        var live=new HashMap<String,NodeEndpoint>();var cfg=config("n1");
+        var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();var cfg=config("n1");
         try(var n2=follower(config("n2"));var n1=leader(cfg,live)){
             n2.start();register(live,"n2",n2);n1.start();var c=channel(n1);
             try {
@@ -133,7 +133,7 @@ class Phase8RealThreeNodeTest {
         }
     }
     @Test void repeatedReadsDoNotChangeWalOrReplicationIndexes() throws Exception {
-        var live=new HashMap<String,NodeEndpoint>();
+        var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var n2=follower(config("n2"));var n1=leader(config("n1"),live)){
             n2.start();register(live,"n2",n2);n1.start();var c=channel(n1);
             try {
@@ -150,7 +150,7 @@ class Phase8RealThreeNodeTest {
         }
     }
     @Test void concurrentOverwriteAndReadsNeverMixValueWithCommitIndex() throws Exception {
-        var live=new HashMap<String,NodeEndpoint>();
+        var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var n2=follower(config("n2"));var n1=leader(config("n1"),live)){
             n2.start();register(live,"n2",n2);n1.start();var c=channel(n1);
             ExecutorService workers=Executors.newFixedThreadPool(2);
@@ -184,7 +184,7 @@ class Phase8RealThreeNodeTest {
         }
     }
     @Test void recoveredLeaderWithCommitMustNotServeUnreplayedValues() throws Exception {
-        var live=new HashMap<String,NodeEndpoint>();var cfg=config("n1");
+        var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();var cfg=config("n1");
         try(var n2=follower(config("n2"));var n1=leader(cfg,live)){
             n2.start();register(live,"n2",n2);n1.start();var c=channel(n1);
             try{assertEquals(ResultCode.RESULT_CODE_OK,put(c,"id","x",new byte[]{8}).getCode());}

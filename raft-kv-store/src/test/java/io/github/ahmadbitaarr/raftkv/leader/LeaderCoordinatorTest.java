@@ -79,6 +79,39 @@ class LeaderCoordinatorTest {
         assertEquals(2,wal.durableCommitIndex());assertEquals(2,applier.appliedIndex());
         assertTrue(applier.diagnosticGetForTest("x").isEmpty());
     }
+    @Test void backgroundContentionBeforeAppendReturnsNotReadyAndDoesNotLatchUnresolvedSuffix() throws Exception {
+        start(ackN2Only(), id -> id.equals("n2")
+                ? Optional.of(new FollowerStatusProbe.Status(id,NodeRole.FOLLOWER,0,0,0,false))
+                : Optional.empty());
+        var occupied=new CountDownLatch(1);
+        var release=new CountDownLatch(1);
+        var pool=Executors.newSingleThreadExecutor();
+        try {
+            var background=pool.submit(()->manager.backgroundAttempt("n2",()->{
+                occupied.countDown();
+                while(release.getCount()>0) {
+                    try {release.await();}catch(InterruptedException ignored) { /* simulate uncancellable RPC */ }
+                }
+                return "completed";
+            }));
+            assertTrue(occupied.await(3,TimeUnit.SECONDS));
+            var blocked=coordinator.mutate("r1",Command.put("x",new byte[]{1}));
+            assertEquals(LeaderCoordinator.Code.NOT_READY,blocked.code());
+            assertEquals(0,wal.lastDurableLogIndex(),"do not append before securing a usable follower slot");
+            assertEquals(0,publishedLog.get());
+            assertEquals(0,wal.durableCommitIndex());
+            assertFalse(coordinator.hasUnresolvedSuffix(),"local contention is not NO_QUORUM");
+            assertEquals(0,applier.appliedIndex());
+            release.countDown();
+            assertEquals("completed",background.get(3,TimeUnit.SECONDS).orElseThrow());
+            var recovered=coordinator.mutate("r1",Command.put("x",new byte[]{1}));
+            assertEquals(LeaderCoordinator.Code.OK,recovered.code());
+            assertEquals(1,wal.lastDurableLogIndex());
+            assertEquals(1,wal.durableCommitIndex());
+            assertEquals(1,applier.appliedIndex());
+            assertFalse(coordinator.hasUnresolvedSuffix());
+        } finally {release.countDown();pool.shutdownNow();}
+    }
     @Test void noQuorumLatchesUnresolvedSuffixAndPreventsNextAppend()throws Exception {
         start(unavailable(),emptyFollowers());
         assertEquals(LeaderCoordinator.Code.NO_QUORUM,coordinator.mutate("r1",Command.put("x",new byte[]{1})).code());
