@@ -14,7 +14,7 @@ public final class NodeMain {
                 try{owner.close();}catch(Exception e){System.err.println("Node shutdown failed: "+e);}
             },"raftkv-node-shutdown"));
             node.start();
-            System.out.println("Node control-only listener bound: "+node.boundPort()+" dataReady=false");
+            System.out.println("Node listener bound: "+node.boundPort()+" state="+node.statusSnapshot().state()+" dataReady="+node.statusSnapshot().ready());
             node.awaitTermination();
             node.close();
         }catch(Exception failure){

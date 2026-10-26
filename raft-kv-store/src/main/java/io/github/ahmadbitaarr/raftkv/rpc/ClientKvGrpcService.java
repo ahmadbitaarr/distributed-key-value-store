@@ -4,6 +4,8 @@ import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 import io.github.ahmadbitaarr.raftkv.config.ClusterConfig;
 import io.github.ahmadbitaarr.raftkv.leader.LeaderCoordinator;
+import io.github.ahmadbitaarr.raftkv.leader.LeaderReadCoordinator;
+import com.google.protobuf.ByteString;
 import io.github.ahmadbitaarr.raftkv.log.Command;
 import io.github.ahmadbitaarr.raftkv.server.*;
 import io.github.ahmadbitaarr.raftkv.rpc.generated.client.v1.*;
@@ -17,6 +19,7 @@ public final class ClientKvGrpcService extends KeyValueServiceGrpc.KeyValueServi
     private final ClusterConfig config;
     private final Supplier<NodeStatusSnapshot> snapshot;
     private final LeaderCoordinator coordinator;
+    private final LeaderReadCoordinator reads;
 
     /** Phase 5/6 compatibility: no leader mutations enabled when collaborator is absent. */
     public ClientKvGrpcService(ClusterConfig config,Supplier<NodeStatusSnapshot> snapshot) {
@@ -24,9 +27,14 @@ public final class ClientKvGrpcService extends KeyValueServiceGrpc.KeyValueServi
     }
     public ClientKvGrpcService(ClusterConfig config,Supplier<NodeStatusSnapshot> snapshot,
                                LeaderCoordinator coordinator) {
+        this(config,snapshot,coordinator,null);
+    }
+    public ClientKvGrpcService(ClusterConfig config,Supplier<NodeStatusSnapshot> snapshot,
+                               LeaderCoordinator coordinator,LeaderReadCoordinator reads) {
         this.config=Objects.requireNonNull(config,"config");
         this.snapshot=Objects.requireNonNull(snapshot,"snapshot");
         this.coordinator=coordinator;
+        this.reads=reads;
     }
 
     @Override public void put(PutRequest request,StreamObserver<MutationResponse> observer) {
@@ -73,14 +81,27 @@ public final class ClientKvGrpcService extends KeyValueServiceGrpc.KeyValueServi
         GetResponse reply;
         try {
             var current=snapshot.get();
-            boolean follower=current.state()==NodeLifecycleState.CONTROL_ONLY && current.role()==NodeRole.FOLLOWER;
-            var builder=GetResponse.newBuilder().setKey(request.getKey())
-                    .setCode(follower?ResultCode.RESULT_CODE_NOT_LEADER:ResultCode.RESULT_CODE_NOT_READY);
-            if(follower)builder.setLeaderHint(leaderHint());
+            var builder=GetResponse.newBuilder().setKey(request.getKey());
+            if(current.role()==NodeRole.FOLLOWER && current.state()==NodeLifecycleState.CONTROL_ONLY){
+                builder.setCode(ResultCode.RESULT_CODE_NOT_LEADER).setLeaderHint(leaderHint());
+            }else if(current.role()!=NodeRole.LEADER || current.state()!=NodeLifecycleState.READY
+                    || !current.ready() || reads==null){
+                builder.setCode(ResultCode.RESULT_CODE_NOT_READY);
+            }else{
+                var outcome=reads.read(request.getKey());
+                switch(outcome.code()){
+                    case OK -> builder.setCode(ResultCode.RESULT_CODE_OK)
+                            .setValue(ByteString.copyFrom(outcome.value().orElseThrow()))
+                            .setCommitIndex(outcome.commitIndex());
+                    case NOT_FOUND -> builder.setCode(ResultCode.RESULT_CODE_NOT_FOUND)
+                            .setCommitIndex(outcome.commitIndex());
+                    case NOT_READY -> builder.setCode(ResultCode.RESULT_CODE_NOT_READY);
+                }
+            }
             reply=builder.build();
             ClientContractValidator.validate(reply,request);
         } catch(RuntimeException failed) {
-            observer.onError(Status.INTERNAL.withDescription("GET control handler failed").asRuntimeException());return;
+            observer.onError(Status.INTERNAL.withDescription("GET handler failed").asRuntimeException());return;
         }
         observer.onNext(reply);observer.onCompleted();
     }
@@ -91,7 +112,8 @@ public final class ClientKvGrpcService extends KeyValueServiceGrpc.KeyValueServi
         if(follower) {
             return builder.setCode(ResultCode.RESULT_CODE_NOT_LEADER).setLeaderHint(leaderHint()).build();
         }
-        if(current.state()!=NodeLifecycleState.CONTROL_ONLY || current.role()!=NodeRole.LEADER || coordinator==null)
+        if((current.state()!=NodeLifecycleState.CONTROL_ONLY && current.state()!=NodeLifecycleState.READY)
+                || current.role()!=NodeRole.LEADER || coordinator==null)
             return builder.setCode(ResultCode.RESULT_CODE_NOT_READY).build();
         LeaderCoordinator.MutationResult result=coordinator.mutate(requestId,command);
         return switch(result.code()) {

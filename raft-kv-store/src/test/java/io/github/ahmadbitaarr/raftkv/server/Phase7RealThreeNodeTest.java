@@ -78,7 +78,8 @@ class Phase7RealThreeNodeTest {
                 assertEquals(2,leader.statusSnapshot().appliedIndex());
                 var read=KeyValueServiceGrpc.newBlockingStub(ch)
                         .get(GetRequest.newBuilder().setKey("key").build());
-                assertEquals(ResultCode.RESULT_CODE_NOT_READY,read.getCode());
+                assertEquals(ResultCode.RESULT_CODE_NOT_FOUND,read.getCode());
+                assertEquals(2,read.getCommitIndex());
             } finally {ch.shutdownNow();}
         }
         try(var recovered=FileWalStore.open(c1.walFile())) {

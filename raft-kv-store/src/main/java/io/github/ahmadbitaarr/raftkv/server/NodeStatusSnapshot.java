@@ -1,7 +1,7 @@
 package io.github.ahmadbitaarr.raftkv.server;
 
 import java.util.Objects;
-/** One atomic, immutable view of recovered metadata; does not grant mutation/read permission. */
+/** One immutable, internally consistent publication of node lifecycle and WAL/application progress. */
 public record NodeStatusSnapshot(String localNodeId,NodeRole role,NodeLifecycleState state,
         long lastLogIndex,long durableCommitIndex,long appliedIndex,boolean ready) {
     public NodeStatusSnapshot {
@@ -9,7 +9,9 @@ public record NodeStatusSnapshot(String localNodeId,NodeRole role,NodeLifecycleS
         if(localNodeId.isBlank() || lastLogIndex<0 || durableCommitIndex<0 || appliedIndex<0
            || appliedIndex>durableCommitIndex || durableCommitIndex>lastLogIndex)
             throw new IllegalArgumentException("invalid node status indexes or identity");
-        if(ready || state==NodeLifecycleState.READY)throw new IllegalArgumentException("Phase 5 cannot be data ready");
+        if(ready != (state==NodeLifecycleState.READY)
+                || (ready && role!=NodeRole.LEADER))
+            throw new IllegalArgumentException("READY requires the configured leader and ready=true");
     }
-    public NodeStatusSnapshot withState(NodeLifecycleState next){return new NodeStatusSnapshot(localNodeId,role,next,lastLogIndex,durableCommitIndex,appliedIndex,false);}
+    public NodeStatusSnapshot withState(NodeLifecycleState next){return new NodeStatusSnapshot(localNodeId,role,next,lastLogIndex,durableCommitIndex,appliedIndex,next==NodeLifecycleState.READY);}
 }

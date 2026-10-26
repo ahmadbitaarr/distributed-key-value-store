@@ -101,7 +101,7 @@ public final class ReplicationGrpcService extends ReplicationServiceGrpc.Replica
                     .setRole(current.role()==NodeRole.LEADER?io.github.ahmadbitaarr.raftkv.rpc.generated.replication.v1.NodeRole.NODE_ROLE_LEADER:
                             io.github.ahmadbitaarr.raftkv.rpc.generated.replication.v1.NodeRole.NODE_ROLE_FOLLOWER)
                     .setLastLogIndex(current.lastLogIndex()).setCommitIndex(current.durableCommitIndex())
-                    .setAppliedIndex(current.appliedIndex()).setReady(false).build();
+                    .setAppliedIndex(current.appliedIndex()).setReady(current.ready()).build();
             ReplicationContractValidator.validate(response);
         } catch (IllegalArgumentException | NullPointerException e) {
             observer.onError(Status.INVALID_ARGUMENT.withDescription(e.getMessage()).asRuntimeException());

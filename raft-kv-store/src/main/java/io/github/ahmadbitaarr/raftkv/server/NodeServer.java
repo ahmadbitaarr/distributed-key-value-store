@@ -12,6 +12,7 @@ import io.github.ahmadbitaarr.raftkv.replication.ReplicationManager;
 import io.github.ahmadbitaarr.raftkv.commit.AckTracker;
 import io.github.ahmadbitaarr.raftkv.commit.CommitManager;
 import io.github.ahmadbitaarr.raftkv.leader.LeaderCoordinator;
+import io.github.ahmadbitaarr.raftkv.leader.LeaderReadCoordinator;
 import io.github.ahmadbitaarr.raftkv.statemachine.KvStateMachine;
 import io.github.ahmadbitaarr.raftkv.statemachine.StateMachineApplier;
 import io.github.ahmadbitaarr.raftkv.rpc.*;
@@ -19,6 +20,7 @@ import io.github.ahmadbitaarr.raftkv.wal.*;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.Objects;
+import java.util.function.Consumer;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -28,12 +30,15 @@ public final class NodeServer implements AutoCloseable {
         Server build(ClusterConfig config,int port,ClientKvGrpcService client,ReplicationGrpcService replication);
     }
     @FunctionalInterface interface WalOpener { WalStore open(java.nio.file.Path path) throws IOException; }
+    /** Test-only barrier at the bound-listener / leader-admission boundary. */
+    @FunctionalInterface interface StartupBoundary { void run(int boundPort,Consumer<IOException> storageFailure) throws IOException; }
 
     private final ClusterConfig config;
     private final int port;
     private final ServerFactory serverFactory;
     private final WalOpener walOpener;
     private final Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory;
+    private final StartupBoundary startupBoundary;
     private final ReplicationOperationGate replicationGate=new ReplicationOperationGate();
     private final AtomicReference<NodeStatusSnapshot> published;
     private final AtomicReference<IOException> storageFault=new AtomicReference<>();
@@ -43,6 +48,7 @@ public final class NodeServer implements AutoCloseable {
     private ReplicationManager replicationManager;
     private LeaderCoordinator leaderCoordinator;
     private StateMachineApplier leaderApplier;
+    private LeaderReadCoordinator leaderReads;
 
     public NodeServer(ClusterConfig config){this(config,-1,NodeServer::buildNetty,FileWalStore::open);}
     NodeServer(ClusterConfig config,int testPortOverride){this(config,testPortOverride,NodeServer::buildNetty,FileWalStore::open);}
@@ -57,9 +63,19 @@ public final class NodeServer implements AutoCloseable {
             Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory) {
         this(config,testPortOverride,NodeServer::buildNetty,FileWalStore::open,outboundClientFactory);
     }
+    NodeServer(ClusterConfig config,int testPortOverride,
+            Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory,StartupBoundary startupBoundary) {
+        this(config,testPortOverride,NodeServer::buildNetty,FileWalStore::open,outboundClientFactory,startupBoundary);
+    }
     private NodeServer(ClusterConfig config,int testPortOverride,ServerFactory serverFactory,
             WalOpener walOpener,Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory){
+        this(config,testPortOverride,serverFactory,walOpener,outboundClientFactory,(ignoredPort,ignoredFailure) -> {});
+    }
+    private NodeServer(ClusterConfig config,int testPortOverride,ServerFactory serverFactory,
+            WalOpener walOpener,Function<ClusterConfig,GrpcFollowerClient> outboundClientFactory,
+            StartupBoundary startupBoundary){
         this.outboundClientFactory=Objects.requireNonNull(outboundClientFactory,"outboundClientFactory");
+        this.startupBoundary=Objects.requireNonNull(startupBoundary,"startupBoundary");
         this.config=Objects.requireNonNull(config,"config");
         this.serverFactory=Objects.requireNonNull(serverFactory,"serverFactory");
         this.walOpener=Objects.requireNonNull(walOpener,"walOpener");
@@ -70,6 +86,9 @@ public final class NodeServer implements AutoCloseable {
     }
     public NodeStatusSnapshot statusSnapshot(){return published.get();}
     ReplicationOperationGate operationGateForTest(){return replicationGate;}
+    LeaderReadCoordinator readCoordinatorForTest(){return leaderReads;}
+    LeaderCoordinator leaderCoordinatorForTest(){return leaderCoordinator;}
+    StateMachineApplier readApplierForTest(){return leaderApplier;}
     public synchronized int boundPort(){return server!=null && !server.isShutdown()?server.getPort():-1;}
 
     public synchronized void start() throws IOException {
@@ -82,6 +101,9 @@ public final class NodeServer implements AutoCloseable {
             WalStore store=walOpener.open(config.walFile());
             log=new WalBackedPersistentLog(store); // one opened WAL; single owner
             WalRecoveryResult recovery=store.recoveryResult();
+            // Capture READY eligibility from recovered WAL BEFORE opening mutation admission.
+            final boolean freshLeaderAtRecovery=config.localRole()==NodeRole.LEADER
+                    && recovery.entries().isEmpty() && recovery.commitIndex()==0;
             published.set(new NodeStatusSnapshot(config.localNodeId(),config.localRole(),
                     NodeLifecycleState.RECOVERING,recovery.entries().size(),recovery.commitIndex(),0,false));
             FollowerReplicationHandler follower=config.localRole()==NodeRole.FOLLOWER
@@ -93,41 +115,76 @@ public final class NodeServer implements AutoCloseable {
                 var tracker=new AckTracker(config,log,store);
                 var committer=new CommitManager(tracker,store,log,this::publishCommitIndex);
                 leaderApplier=new StateMachineApplier(new KvStateMachine());
+                if(leaderApplier.appliedIndex()!=0)
+                    throw new IOException("leader state machine is not empty at startup");
+                leaderReads=new LeaderReadCoordinator(leaderApplier,this::readSnapshotForRead);
                 leaderCoordinator=new LeaderCoordinator(config,log,store,replicationManager,outgoing,
                         tracker,committer,leaderApplier,this::publishDurableIndex,
                         this::publishAppliedIndex,this::recordFatalStorageFailure);
             }
-            var client=new ClientKvGrpcService(config,this::statusSnapshot,leaderCoordinator);
+            var client=new ClientKvGrpcService(config,this::statusSnapshot,leaderCoordinator,leaderReads);
             var peers=new ReplicationGrpcService(config,this::statusSnapshot,follower);
             server=serverFactory.build(config,port,client,peers);
             server.start();
             transition(NodeLifecycleState.CONTROL_ONLY);
             if(follower!=null) replicationGate.open();
-            if(leaderCoordinator!=null) leaderCoordinator.openAfterStartup();
+            if(leaderCoordinator!=null) {
+                // The listener is live, but no leader mutation can append while READY is published.
+                startupBoundary.run(server.getPort(),this::recordFatalStorageFailure);
+                requireHealthyLeaderStartup();
+                if(freshLeaderAtRecovery) {
+                    leaderReads.openAfterStartup();
+                    requireHealthyLeaderStartup();
+                    transition(NodeLifecycleState.READY);
+                }
+                requireHealthyLeaderStartup();
+                // Open write admission LAST: a first PUT cannot invalidate READY eligibility.
+                // Recovered nonempty leaders retain their closed write gate.
+                leaderCoordinator.openAfterStartup();
+                requireHealthyLeaderStartup();
+            }
         }catch(IOException | RuntimeException failure){
             replicationGate.closeAdmission();
+            if(leaderReads!=null)leaderReads.closeAdmission();
             if(leaderCoordinator!=null)leaderCoordinator.closeAdmission();
-            transition(NodeLifecycleState.FAILED);
+            if(statusSnapshot().state()!=NodeLifecycleState.FAILED)transition(NodeLifecycleState.FAILED);
             try{releaseResourcesAfterTermination();}catch(IOException | RuntimeException cleanup){failure.addSuppressed(cleanup);}
             if(failure instanceof IOException io) throw io;
             throw new IOException("node startup failed",failure);
         }
     }
 
+    private void requireHealthyLeaderStartup() throws IOException {
+        IOException failure=storageFault.get();
+        if(failure==null && leaderCoordinator!=null)failure=leaderCoordinator.storageFailure();
+        if(failure!=null)throw new IOException("fatal storage failure during leader startup",failure);
+    }
+
+    /** A latched storage failure is never obscured by a racing READY publication. */
+    private NodeStatusSnapshot readSnapshotForRead(){
+        var current=published.get();
+        if(current.state()==NodeLifecycleState.READY
+                && (storageFault.get()!=null || (leaderCoordinator!=null
+                        && leaderCoordinator.storageFailure()!=null)))
+            return current.withState(NodeLifecycleState.FAILED);
+        return current;
+    }
+
     private void publishDurableIndex(long lastIndex){
         published.updateAndGet(old->new NodeStatusSnapshot(old.localNodeId(),old.role(),old.state(),
-                lastIndex,old.durableCommitIndex(),old.appliedIndex(),false));
+                lastIndex,old.durableCommitIndex(),old.appliedIndex(),old.ready()));
     }
     private void publishCommitIndex(long committed) {
         published.updateAndGet(old->new NodeStatusSnapshot(old.localNodeId(),old.role(),old.state(),
-                old.lastLogIndex(),committed,old.appliedIndex(),false));
+                old.lastLogIndex(),committed,old.appliedIndex(),old.ready()));
     }
     private void publishAppliedIndex(long applied) {
         published.updateAndGet(old->new NodeStatusSnapshot(old.localNodeId(),old.role(),old.state(),
-                old.lastLogIndex(),old.durableCommitIndex(),applied,false));
+                old.lastLogIndex(),old.durableCommitIndex(),applied,old.ready()));
     }
     private void recordFatalStorageFailure(IOException failure){
         storageFault.compareAndSet(null,failure);
+        if(leaderReads!=null)leaderReads.closeAdmission();
         published.updateAndGet(old->{
             var state=old.state();
             if(state==NodeLifecycleState.STOPPING || state==NodeLifecycleState.STOPPED) return old;
@@ -148,6 +205,7 @@ public final class NodeServer implements AutoCloseable {
     @Override public synchronized void close() throws IOException {
         if(statusSnapshot().state()==NodeLifecycleState.STOPPED)return;
         transition(NodeLifecycleState.STOPPING);
+        if(leaderReads!=null)leaderReads.closeAdmission();
         replicationGate.closeAdmission();
         if(leaderCoordinator!=null)leaderCoordinator.closeAdmission();
         releaseResourcesAfterTermination();
@@ -179,6 +237,16 @@ public final class NodeServer implements AutoCloseable {
         }catch(InterruptedException interrupted){
             Thread.currentThread().interrupt();
             throw new IOException("interrupted awaiting WAL operations; WAL lease retained",interrupted);
+        }
+        // An accepted GET retains its permit until state access actually completes.
+        if(leaderReads!=null) {
+            try {
+                if(!leaderReads.awaitDrained(config.shutdownGraceMs(),TimeUnit.MILLISECONDS))
+                    throw new IOException("leader read still active; WAL lease retained");
+            } catch(InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted awaiting leader read drainage; WAL lease retained",interrupted);
+            }
         }
         // Independent leader mutation permits and outbound worker ownership must finish
         // before the one WAL is closed or the directory lease is released.
