@@ -23,7 +23,7 @@ class NodeLoopbackGrpcTest {
  private ReplicationServiceGrpc.ReplicationServiceBlockingStub peer(ManagedChannel c){return ReplicationServiceGrpc.newBlockingStub(c).withDeadlineAfter(15,TimeUnit.SECONDS);}
  @Test void nodeBindsRealLoopbackGrpcListener()throws Exception{try(var n=node("n1")){var c=channel(n.boundPort());try{var response=client(c).get(GetRequest.newBuilder().setKey("x").build());assertEquals(ResultCode.RESULT_CODE_NOT_FOUND,response.getCode());assertEquals(0,response.getCommitIndex());}finally{c.shutdownNow();}}}
  @Test void followerLoopbackClientGetReturnsNotLeader()throws Exception{try(var n=node("n2")){var c=channel(n.boundPort());try{assertEquals(ResultCode.RESULT_CODE_NOT_LEADER,client(c).get(GetRequest.newBuilder().setKey("x").build()).getCode());}finally{c.shutdownNow();}}}
- @Test void leaderLoopbackClientGetReturnsNotReadyWithCommittedWal()throws Exception{try(var store=FileWalStore.open(dir.resolve("raftkv.wal"))){store.appendEntryDurably(new LogEntry(1,"r",Command.put("x",new byte[]{1}),new byte[]{2}));store.appendCommitDurably(1);}try(var n=node("n1")){var c=channel(n.boundPort());try{var response=client(c).get(GetRequest.newBuilder().setKey("x").build());assertEquals(ResultCode.RESULT_CODE_NOT_READY,response.getCode());assertFalse(response.hasCommitIndex());}finally{c.shutdownNow();}}}
+ @Test void leaderLoopbackClientGetReturnsNotReadyWithCommittedWal()throws Exception{try(var store=FileWalStore.open(dir.resolve("raftkv.wal"))){store.appendEntryDurably(new LogEntry(1,"r",Command.put("x",new byte[]{1}),io.github.ahmadbitaarr.raftkv.leader.CanonicalCommandFingerprint.of(Command.put("x",new byte[]{1}))));store.appendCommitDurably(1);}try(var n=node("n1")){var c=channel(n.boundPort());try{var response=client(c).get(GetRequest.newBuilder().setKey("x").build());assertEquals(ResultCode.RESULT_CODE_NOT_READY,response.getCode());assertFalse(response.hasCommitIndex());}finally{c.shutdownNow();}}}
  @Test void loopbackReplicationStatusIsValidAndNotReady()throws Exception{try(var n=node("n2")){var c=channel(n.boundPort());try{var x=peer(c).getReplicationStatus(ReplicationStatusRequest.newBuilder().setLeaderId("n1").build());assertFalse(x.getReady());assertEquals(0,x.getAppliedIndex());}finally{c.shutdownNow();}}}
  @Test void loopbackLargePutOverFourMiBReachesHandler()throws Exception{
   try(var n=node("n1")){
@@ -50,7 +50,7 @@ class NodeLoopbackGrpcTest {
  @Test void bindConflictFailsWithoutDamagingOriginalWal()throws Exception{try(var n=node("n1")){try(var dup=new NodeServer(ClusterConfigTest.config(dir,"n1"),n.boundPort())){assertThrows(Exception.class,dup::start);}}}
  @Test void reopenAfterShutdownPreservesRecoveredWalMetadata() throws Exception {
   try(var store=FileWalStore.open(dir.resolve("raftkv.wal"))) {
-   store.appendEntryDurably(new LogEntry(1,"r",Command.delete("x"),new byte[]{2}));
+   store.appendEntryDurably(new LogEntry(1,"r",Command.delete("x"),io.github.ahmadbitaarr.raftkv.leader.CanonicalCommandFingerprint.of(Command.delete("x"))));
   }
   // First restart canonicalizes the uncommitted WAL to zero but cannot open data admission.
   try(var n=node("n1")) {

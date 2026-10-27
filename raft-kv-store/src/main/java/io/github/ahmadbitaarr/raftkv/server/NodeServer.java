@@ -75,6 +75,11 @@ public final class NodeServer implements AutoCloseable {
             Function<ClusterConfig,? extends io.github.ahmadbitaarr.raftkv.replication.FollowerMaintenanceClient> outboundClientFactory,StartupBoundary startupBoundary) {
         this(config,testPortOverride,NodeServer::buildNetty,FileWalStore::open,outboundClientFactory,startupBoundary);
     }
+    /** Package-local test seam: real Netty with an injected WAL force boundary and real peer channels. */
+    NodeServer(ClusterConfig config,int testPortOverride,WalOpener walOpener,
+            Function<ClusterConfig,? extends io.github.ahmadbitaarr.raftkv.replication.FollowerMaintenanceClient> outboundClientFactory){
+        this(config,testPortOverride,NodeServer::buildNetty,walOpener,outboundClientFactory);
+    }
     private NodeServer(ClusterConfig config,int testPortOverride,ServerFactory serverFactory,
             WalOpener walOpener,Function<ClusterConfig,? extends io.github.ahmadbitaarr.raftkv.replication.FollowerMaintenanceClient> outboundClientFactory){
         this(config,testPortOverride,serverFactory,walOpener,outboundClientFactory,(ignoredPort,ignoredFailure) -> {});

@@ -119,6 +119,7 @@ public final class ClientKvGrpcService extends KeyValueServiceGrpc.KeyValueServi
         return switch(result.code()) {
             case OK -> builder.setCode(ResultCode.RESULT_CODE_OK).setCommitIndex(result.commitIndex()).build();
             case NO_QUORUM -> builder.setCode(ResultCode.RESULT_CODE_NO_QUORUM).build();
+            case REQUEST_ID_CONFLICT -> builder.setCode(ResultCode.RESULT_CODE_REQUEST_ID_CONFLICT).build();
             case NOT_READY -> builder.setCode(ResultCode.RESULT_CODE_NOT_READY).build();
         };
     }

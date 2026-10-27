@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.*;
 class NodeServerTest {
  @TempDir Path dir;
  private NodeServer node(String id,Path walDir) {return new NodeServer(ClusterConfigTest.config(walDir,id),0);}
- private void wal(Path directory, boolean committed)throws Exception{Files.createDirectories(directory);try(var store=FileWalStore.open(directory.resolve("raftkv.wal"))){store.appendEntryDurably(new LogEntry(1,"rid",Command.put("x",new byte[]{42}),new byte[]{3}));if(committed)store.appendCommitDurably(1);}}
+ private void wal(Path directory, boolean committed)throws Exception{Files.createDirectories(directory);try(var store=FileWalStore.open(directory.resolve("raftkv.wal"))){store.appendEntryDurably(new LogEntry(1,"rid",Command.put("x",new byte[]{42}),io.github.ahmadbitaarr.raftkv.leader.CanonicalCommandFingerprint.of(Command.put("x",new byte[]{42}))));if(committed)store.appendCommitDurably(1);}}
  @Test void newEmptyWalStartsReadyOnlyOnLeader()throws Exception{
   try(var n=node("n1",dir)){n.start();assertEquals(NodeLifecycleState.READY,n.statusSnapshot().state());assertTrue(n.statusSnapshot().ready());}
   try(var n=node("n2",dir.resolve("follower"))){n.start();assertEquals(NodeLifecycleState.CONTROL_ONLY,n.statusSnapshot().state());assertFalse(n.statusSnapshot().ready());}

@@ -78,17 +78,44 @@ class Phase10RecoveredLeaderAdmissionTest {
             node.start();
             assertEquals(NodeLifecycleState.CONTROL_ONLY,node.statusSnapshot().state());
             assertEquals(1,node.statusSnapshot().appliedIndex());
+            assertFalse(node.leaderCoordinatorForTest().isActive());
             assertEquals(LeaderReadCoordinator.Code.NOT_READY,node.readCoordinatorForTest().read("x").code());
             assertEquals(LeaderCoordinator.Code.NOT_READY,node.leaderCoordinatorForTest().mutate(
                     "unverified",Command.put("x",new byte[]{99})).code());
+            // Even an already committed ID must not expose deduplication results before
+            // the Phase 10 follower-witness certificate authorizes data admission.
+            assertEquals(LeaderCoordinator.Code.NOT_READY,node.leaderCoordinatorForTest().mutate(
+                    "prior",Command.put("x",new byte[]{1,0})).code());
+            assertEquals(LeaderCoordinator.Code.NOT_READY,node.leaderCoordinatorForTest().mutate(
+                    "prior",Command.put("x",new byte[]{77})).code());
+            assertEquals(1,node.statusSnapshot().lastLogIndex());
+            assertEquals(1,node.statusSnapshot().durableCommitIndex());
             peer.online.set(true);
             long deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(4);
             while(!node.statusSnapshot().ready() && System.nanoTime()<deadline)Thread.sleep(10);
-            assertTrue(node.statusSnapshot().ready());
+            assertTrue(node.statusSnapshot().ready(),"a verified follower must authorize recovered READY");
             assertEquals(LeaderReadCoordinator.Code.OK,node.readCoordinatorForTest().read("x").code());
             assertArrayEquals(new byte[]{1,0},node.readCoordinatorForTest().read("x").value().orElseThrow());
-            assertEquals(LeaderCoordinator.Code.NOT_READY,node.leaderCoordinatorForTest().mutate(
-                    "prior",Command.put("x",new byte[]{77})).code());
+            // READY is published before the writer gate opens. isActive() describes an
+            // in-flight mutation permit, NOT whether new writes are admitted. Probe the
+            // actual admission path using a conflicting committed ID: this cannot append.
+            deadline=System.nanoTime()+TimeUnit.SECONDS.toNanos(4);
+            var conflict=node.leaderCoordinatorForTest().mutate(
+                    "prior",Command.put("x",new byte[]{77}));
+            while(conflict.code()==LeaderCoordinator.Code.NOT_READY && System.nanoTime()<deadline) {
+                Thread.sleep(10);
+                conflict=node.leaderCoordinatorForTest().mutate(
+                        "prior",Command.put("x",new byte[]{77}));
+            }
+            assertEquals(LeaderCoordinator.Code.REQUEST_ID_CONFLICT,conflict.code(),
+                    "a recovered READY leader must open mutation admission after certification");
+            var original=node.leaderCoordinatorForTest().mutate(
+                    "prior",Command.put("x",new byte[]{1,0}));
+            assertEquals(LeaderCoordinator.Code.OK,original.code());
+            assertEquals(1,original.commitIndex());
+            assertEquals(1,node.statusSnapshot().lastLogIndex());
+            assertEquals(1,node.statusSnapshot().durableCommitIndex());
+            assertEquals(1,node.statusSnapshot().appliedIndex());
             assertEquals(LeaderCoordinator.Code.OK,node.leaderCoordinatorForTest().mutate(
                     "new",Command.put("x",new byte[]{2})).code());
             assertEquals(2,node.statusSnapshot().lastLogIndex());

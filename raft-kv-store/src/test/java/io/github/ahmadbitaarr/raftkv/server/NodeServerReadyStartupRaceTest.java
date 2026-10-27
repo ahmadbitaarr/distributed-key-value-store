@@ -59,7 +59,7 @@ class NodeServerReadyStartupRaceTest {
     }
     private static void seed(Path path,boolean committed) throws IOException {
         try(var wal=FileWalStore.open(path)) {
-            wal.appendEntryDurably(new LogEntry(1,"seed",Command.put("key",new byte[]{1}),new byte[]{2}));
+            wal.appendEntryDurably(new LogEntry(1,"seed",Command.put("key",new byte[]{1}),io.github.ahmadbitaarr.raftkv.leader.CanonicalCommandFingerprint.of(Command.put("key",new byte[]{1}))));
             if(committed)wal.appendCommitDurably(1);
         }
     }

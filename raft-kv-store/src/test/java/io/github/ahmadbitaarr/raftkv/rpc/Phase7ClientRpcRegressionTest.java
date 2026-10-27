@@ -72,7 +72,8 @@ class Phase7ClientRpcRegressionTest {
                 assertEquals(1,callbackCalls.get());
                 assertEquals(1,wal.durableCommitIndex());
                 var second=new Recorder();service.put(put("once"),second);
-                assertEquals(ResultCode.RESULT_CODE_NOT_READY,second.next.getCode());
+                assertEquals(ResultCode.RESULT_CODE_OK,second.next.getCode()); // Phase 11 replays committed result after lost response
+                assertEquals(1,second.next.getCommitIndex());
                 assertEquals(1,log.lastLogIndex());assertEquals(1,wal.durableCommitIndex());
             }
         }

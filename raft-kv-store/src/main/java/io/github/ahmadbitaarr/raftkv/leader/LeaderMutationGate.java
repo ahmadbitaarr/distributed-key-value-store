@@ -4,16 +4,17 @@ import java.util.concurrent.TimeUnit;
 
 /** One-flight admission + shutdown closure under a single independent monitor. */
 public final class LeaderMutationGate {
-    private boolean open, active;
+    private boolean open, active, everClosed;
     public synchronized void open() {
-        if(open || active)throw new IllegalStateException("leader mutation gate cannot reopen");
+        if(open || active || everClosed)throw new IllegalStateException("leader mutation gate cannot reopen");
         open=true;
     }
     public synchronized Permit tryAcquire() {
         if(!open || active)return null;
         active=true;return new Permit();
     }
-    public synchronized void closeAdmission(){open=false;notifyAll();}
+    public synchronized void closeAdmission(){open=false;everClosed=true;notifyAll();}
+    public synchronized boolean admissionOpen(){return open;}
     public synchronized boolean isActive(){return active;}
     public synchronized boolean awaitDrained(long timeout, TimeUnit unit) throws InterruptedException {
         long remaining=unit.toNanos(timeout);

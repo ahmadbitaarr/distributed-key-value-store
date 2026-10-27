@@ -22,15 +22,23 @@ class LeaderCoordinatorTest {
         final FileWalStore delegate;
         boolean failEntry,failCommit,failCommitAfterForce;
         final AtomicInteger commitAttempts=new AtomicInteger();
+        volatile CountDownLatch entryForceEntered, releaseEntryForce;
+        volatile Runnable afterCommitForced=()->{};
         InstrumentedWal(Path path)throws IOException {delegate=FileWalStore.open(path);}
         @Override public WalRecoveryResult recoveryResult(){return delegate.recoveryResult();}
         @Override public void appendEntryDurably(LogEntry entry)throws IOException {
+            if(entryForceEntered!=null){
+                entryForceEntered.countDown();
+                try {if(!releaseEntryForce.await(8,TimeUnit.SECONDS))throw new IOException("force barrier expired");}
+                catch(InterruptedException x){Thread.currentThread().interrupt();throw new IOException("force interrupted",x);}
+            }
             if(failEntry)throw new IOException("injected ENTRY force failure");delegate.appendEntryDurably(entry);
         }
         @Override public void appendCommitDurably(long n)throws IOException {
             commitAttempts.incrementAndGet();
             if(failCommit)throw new IOException("injected COMMIT force failure");
             delegate.appendCommitDurably(n); // the real FileWalStore has completed force(true)
+            afterCommitForced.run();
             if(failCommitAfterForce)throw new IOException("injected error after durable COMMIT force");
         }
         @Override public void rewriteDurably(List<LogEntry> retained,long n)throws IOException {delegate.rewriteDurably(retained,n);}
@@ -128,7 +136,7 @@ class LeaderCoordinatorTest {
     @Test void committedRequestIdNeverAppendsAgain()throws Exception {
         start(ackN2Only(),emptyFollowers());
         assertEquals(LeaderCoordinator.Code.OK,coordinator.mutate("duplicate",Command.put("a",new byte[]{1})).code());
-        assertEquals(LeaderCoordinator.Code.NOT_READY,coordinator.mutate("duplicate",Command.put("b",new byte[]{2})).code());
+        assertEquals(LeaderCoordinator.Code.REQUEST_ID_CONFLICT,coordinator.mutate("duplicate",Command.put("b",new byte[]{2})).code());
         assertEquals(1,log.lastLogIndex());
     }
     @Test void localEntryForceFailurePreventsReplicationAndCommit()throws Exception {
@@ -272,5 +280,149 @@ class LeaderCoordinatorTest {
             assertEquals(LeaderCoordinator.Code.NOT_READY,coordinator.mutate("later",Command.delete("y")).code());
             assertEquals(1,log.lastLogIndex());
         }finally{release.countDown();thread.shutdownNow();}
+    }
+
+    @Test void exactCommittedPutAndDeleteRetryReturnOriginalIndexWithoutAppending()throws Exception {
+        start(ackN2Only(),emptyFollowers());
+        var a=Command.put("x",new byte[]{0,9});var b=Command.delete("x");
+        assertEquals(1,coordinator.mutate("id-put",a).commitIndex());
+        assertEquals(1,coordinator.mutate("id-put",a).commitIndex());
+        assertEquals(2,coordinator.mutate("id-delete",b).commitIndex());
+        assertEquals(2,coordinator.mutate("id-delete",b).commitIndex());
+        assertEquals(2,wal.durableCommitIndex());assertEquals(2,log.lastLogIndex());
+        assertEquals(2,applier.appliedIndex());
+    }
+    @Test void sameIdDifferentOperationKeyOrValueIsConflictWithoutNewEntry()throws Exception {
+        start(ackN2Only(),emptyFollowers());
+        assertEquals(LeaderCoordinator.Code.OK,coordinator.mutate("same",Command.put("x",new byte[0])).code());
+        assertEquals(LeaderCoordinator.Code.REQUEST_ID_CONFLICT,coordinator.mutate("same",Command.delete("x")).code());
+        assertEquals(LeaderCoordinator.Code.REQUEST_ID_CONFLICT,coordinator.mutate("same",Command.put("y",new byte[0])).code());
+        assertEquals(LeaderCoordinator.Code.REQUEST_ID_CONFLICT,coordinator.mutate("same",Command.put("x",new byte[]{0})).code());
+        assertEquals(1,log.lastLogIndex());
+    }
+    @Test void concurrentIdenticalMutationJoinsOwnerDuringBlockedFollowerRpc()throws Exception {
+        var entered=new CountDownLatch(1);var exit=new CountDownLatch(1);
+        start((id,e)->{
+            if(id.equals("n2")) {entered.countDown();try {exit.await(5,TimeUnit.SECONDS);}catch(InterruptedException x){Thread.currentThread().interrupt();}}
+            return id.equals("n2")?FollowerClient.ack(e.index(),e.index()):unavailable().replicate(id,e);
+        },emptyFollowers());
+        var executor=Executors.newFixedThreadPool(3);
+        try {
+            var c=Command.put("x",new byte[]{1,0});
+            var original=executor.submit(()->coordinator.mutate("join-id",c));
+            assertTrue(entered.await(3,TimeUnit.SECONDS));
+            var waiter=executor.submit(()->coordinator.mutate("join-id",c));
+            assertEquals(LeaderCoordinator.Code.REQUEST_ID_CONFLICT,coordinator.mutate("join-id",Command.delete("x")).code());
+            assertEquals(LeaderCoordinator.Code.NOT_READY,coordinator.mutate("unrelated",Command.delete("y")).code());
+            exit.countDown();
+            assertEquals(1,original.get(8,TimeUnit.SECONDS).commitIndex());
+            assertEquals(1,waiter.get(8,TimeUnit.SECONDS).commitIndex());
+            assertEquals(1,log.lastLogIndex());assertEquals(1,wal.durableCommitIndex());
+        } finally {exit.countDown();executor.shutdownNow();}
+    }
+    @Test void joiningTimeoutDoesNotEndOriginalMutationOrCreateAnotherEntry()throws Exception {
+        start(ackN2Only(),emptyFollowers());
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        wal.entryForceEntered=entered;wal.releaseEntryForce=release;
+        var executor=Executors.newFixedThreadPool(2);
+        try {
+            var original=executor.submit(()->coordinator.mutate("stable",Command.delete("x")));
+            assertTrue(entered.await(3,TimeUnit.SECONDS));
+            assertEquals(LeaderCoordinator.Code.REQUEST_ID_CONFLICT,
+                    coordinator.mutate("stable",Command.delete("y")).code(),
+                    "conflict during blocked ENTRY force must reject without a second owner");
+            var waiter=executor.submit(()->coordinator.mutate("stable",Command.delete("x")));
+            assertEquals(LeaderCoordinator.Code.NOT_READY,waiter.get(5,TimeUnit.SECONDS).code());
+            assertEquals(0,wal.lastDurableLogIndex(),"joined timeout must not force ENTRY itself");
+            release.countDown();
+            assertEquals(LeaderCoordinator.Code.NO_QUORUM,original.get(5,TimeUnit.SECONDS).code()); // ENTRY force consumed its fixed Phase 7 deadline
+            assertEquals(1,log.lastLogIndex());
+        }finally{release.countDown();executor.shutdownNow();}
+    }
+    @Test void failedEntryForceCannotBeCachedAsCommittedDuplicate()throws Exception {
+        start(ackN2Only(),emptyFollowers());wal.failEntry=true;
+        assertThrows(IOException.class,()->coordinator.mutate("fault-id",Command.put("x",new byte[]{1})));
+        assertEquals(LeaderCoordinator.Code.NOT_READY,coordinator.mutate("fault-id",Command.put("x",new byte[]{1})).code());
+        assertEquals(0,wal.durableCommitIndex());
+    }
+
+    @Test void committedDuplicateIssuesZeroNewReplicationAndWALCommands()throws Exception {
+        var calls=new AtomicInteger();
+        start((id,e)->{calls.incrementAndGet();return ackN2Only().replicate(id,e);},emptyFollowers());
+        var c=Command.put("x",new byte[]{3});
+        assertEquals(1,coordinator.mutate("original",c).commitIndex());
+        int before=calls.get();
+        assertEquals(1,coordinator.mutate("original",c).commitIndex());
+        assertEquals(before,calls.get(),"duplicate may not contact followers");
+        assertEquals(1,wal.lastDurableLogIndex());assertEquals(1,wal.durableCommitIndex());
+        assertEquals(1,applier.appliedIndex());
+    }
+    @Test void multipleConcurrentIdenticalJoinersShareOneCommitAndSingleWalEntry()throws Exception {
+        start(ackN2Only(),emptyFollowers());
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        wal.entryForceEntered=entered;wal.releaseEntryForce=release;
+        var executor=Executors.newFixedThreadPool(6);
+        try {
+            var c=Command.put("k",new byte[]{3});
+            var owner=executor.submit(()->coordinator.mutate("once",c));
+            assertTrue(entered.await(3,TimeUnit.SECONDS));
+            var joiners=new ArrayList<Future<LeaderCoordinator.MutationResult>>();
+            for(int i=0;i<5;i++)joiners.add(executor.submit(()->coordinator.mutate("once",c)));
+            release.countDown();
+            assertEquals(1,owner.get(8,TimeUnit.SECONDS).commitIndex());
+            for(var joined:joiners)assertEquals(1,joined.get(8,TimeUnit.SECONDS).commitIndex());
+            assertEquals(1,wal.lastDurableLogIndex());assertEquals(1,wal.durableCommitIndex());
+        }finally{release.countDown();executor.shutdownNow();}
+    }
+    @Test void fatalCommitForceFailureWakesIdenticalWaiterAndNeverCachesOk()throws Exception {
+        start(ackN2Only(),emptyFollowers());
+        var entered=new CountDownLatch(1);var release=new CountDownLatch(1);
+        wal.entryForceEntered=entered;wal.releaseEntryForce=release;wal.failCommitAfterForce=true;
+        var executor=Executors.newFixedThreadPool(2);
+        try {
+            var c=Command.put("k",new byte[]{3});
+            var owner=executor.submit(()->coordinator.mutate("broken",c));
+            assertTrue(entered.await(3,TimeUnit.SECONDS));
+            var joiner=executor.submit(()->coordinator.mutate("broken",c));
+            release.countDown();
+            assertThrows(ExecutionException.class,()->owner.get(8,TimeUnit.SECONDS));
+            assertEquals(LeaderCoordinator.Code.NOT_READY,joiner.get(8,TimeUnit.SECONDS).code());
+            assertNotNull(coordinator.storageFailure());
+            assertEquals(1,wal.durableCommitIndex(),"the COMMIT force did physically finish");
+            assertEquals(1,wal.lastDurableLogIndex(),"no second ENTRY was ever appended");
+        }finally{release.countDown();executor.shutdownNow();}
+    }
+
+    @Test void realStateMachineApplicationFailureAfterCommitDoesNotCacheDuplicateOk()throws Exception {
+        start(ackN2Only(),emptyFollowers());
+        var poisoned=Command.delete("x");
+        wal.afterCommitForced=()->{
+            try {
+                var field=Command.class.getDeclaredField("type");field.setAccessible(true);
+                field.set(poisoned,OperationType.PUT); // real KvStateMachine.apply rejects missing PUT value
+            }catch(ReflectiveOperationException e){throw new AssertionError(e);}
+        };
+        assertThrows(IOException.class,()->coordinator.mutate("application-fault",poisoned));
+        assertEquals(1,wal.durableCommitIndex(),"COMMIT force physically succeeded");
+        assertEquals(0,applier.appliedIndex(),"failed command cannot claim applied progress");
+        assertNotNull(coordinator.storageFailure());
+        assertEquals(0,coordinator.deduplicatorForTest().committedCount(),
+                "no successful duplicate record after application failure");
+        assertEquals(LeaderCoordinator.Code.NOT_READY,
+                coordinator.mutate("application-fault",Command.delete("x")).code());
+        assertEquals(1,wal.lastDurableLogIndex(),"must never append a second entry");
+    }
+    @Test void authorityFailureInCommitWakeupWindowCannotCompleteDuplicateAsOk()throws Exception {
+        start(ackN2Only(),emptyFollowers());
+        coordinator.setCommitWakeup(()->coordinator.failExternally(new IOException("injected post-commit authority loss")));
+        var result=coordinator.mutate("authority-race",Command.put("x",new byte[]{1}));
+        assertEquals(LeaderCoordinator.Code.NOT_READY,result.code(),"closed admission suppresses racy OK publication");
+        assertEquals(1,wal.durableCommitIndex(),"COMMIT remains durable, not rolled back");
+        assertEquals(1,applier.appliedIndex());
+        assertEquals(0,coordinator.deduplicatorForTest().committedCount());
+        assertNotNull(coordinator.storageFailure());
+        assertEquals(LeaderCoordinator.Code.NOT_READY,
+                coordinator.mutate("authority-race",Command.put("x",new byte[]{1})).code());
+        assertEquals(1,wal.lastDurableLogIndex());
     }
 }

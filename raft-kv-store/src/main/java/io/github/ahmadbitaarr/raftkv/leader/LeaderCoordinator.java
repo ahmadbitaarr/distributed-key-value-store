@@ -18,7 +18,7 @@ import java.util.function.LongConsumer;
 
 /** Single-flight, fresh-leader only: durable ENTRY -> prefix majority -> durable COMMIT -> apply. */
 public final class LeaderCoordinator {
-    public enum Code { OK, NOT_READY, NO_QUORUM }
+    public enum Code { OK, NOT_READY, NO_QUORUM, REQUEST_ID_CONFLICT }
     public record MutationResult(Code code, long commitIndex) {
         public MutationResult {
             Objects.requireNonNull(code);
@@ -38,7 +38,7 @@ public final class LeaderCoordinator {
     private final LongConsumer publishAppliedIndex;
     private final Consumer<IOException> recordFault;
     private final LeaderMutationGate gate=new LeaderMutationGate();
-    private final Set<String> admittedIds=new HashSet<>(); // one writer, includes unresolved
+    private final RequestDeduplicator deduplicator=new RequestDeduplicator();
     private final AtomicReference<IOException> storageFault=new AtomicReference<>();
     private final boolean freshAtStartup;
     private volatile boolean unresolvedSuffix;
@@ -58,6 +58,10 @@ public final class LeaderCoordinator {
         this.recordFault=Objects.requireNonNull(recordFault);
         if(config.localRole()!=NodeRole.LEADER)throw new IllegalArgumentException("configured leader only");
         freshAtStartup=log.lastLogIndex()==0 && wal.lastDurableLogIndex()==0 && wal.durableCommitIndex()==0;
+        try { deduplicator.reconstruct(log,wal.durableCommitIndex()); }
+        catch(IOException invalidCommittedHistory) {
+            throw new IllegalStateException("committed request reconstruction failed closed",invalidCommittedHistory);
+        }
     }
 
     /** Called only for the original empty-WAL startup, not after tail canonicalization. */
@@ -68,13 +72,10 @@ public final class LeaderCoordinator {
         if(certificate==null || !certificate.validFor(log,wal,applier) || unresolvedSuffix
                 || storageFault.get()!=null || gate.isActive())
             throw new IllegalStateException("invalid recovered-leader write authorization");
-        for(long index=1;index<=wal.durableCommitIndex();index++) {
-            var entry=log.get(index).orElseThrow();
-            admittedIds.add(entry.requestId()); // interim safety guard; not full Phase 11 dedup
-        }
         gate.open();
     }
-    public void closeAdmission() {gate.closeAdmission();}
+    public void closeAdmission() {gate.closeAdmission();deduplicator.closeAdmission();}
+    RequestDeduplicator deduplicatorForTest(){return deduplicator;}
     public boolean hasUnresolvedSuffix(){return unresolvedSuffix;}
     public IOException storageFailure(){return storageFault.get();}
     /** A proven recovered-cluster authority violation also closes an active leader writer. */
@@ -82,7 +83,7 @@ public final class LeaderCoordinator {
         Objects.requireNonNull(failure);
         if(storageFault.compareAndSet(null,failure)) {
             unresolvedSuffix=true;
-            gate.closeAdmission();
+            closeAdmission();
         }
     }
     private void requireNoExternalFailure() throws IOException {
@@ -97,12 +98,60 @@ public final class LeaderCoordinator {
     /** A catch-up wake-up is advisory and cannot affect an already finalized client mutation. */
     public void setCommitWakeup(Runnable listener){committedWakeup=Objects.requireNonNull(listener);}
 
+    /** Classify before acquiring the single-writer permit so identical callers JOIN instead of racing it. */
     public MutationResult mutate(String requestId, Command command) throws IOException {
         Objects.requireNonNull(requestId,"requestId");Objects.requireNonNull(command,"command");
+        if(requestId.isBlank())throw new IllegalArgumentException("blank request ID");
+        if(!gate.admissionOpen() || storageFault.get()!=null)
+            return new MutationResult(Code.NOT_READY,0);
+        byte[] fingerprint=CanonicalCommandFingerprint.of(command);
+        var decision=deduplicator.classify(requestId,command,fingerprint);
+        switch(decision.kind()) {
+            case COMMITTED_DUPLICATE -> {
+                if(!gate.admissionOpen() || storageFault.get()!=null)
+                    return new MutationResult(Code.NOT_READY,0);
+                return new MutationResult(Code.OK,decision.commitIndex());
+            }
+            case CONFLICT -> {return new MutationResult(Code.REQUEST_ID_CONFLICT,0);}
+            case JOIN -> {
+                var completed=RequestDeduplicator.await(decision.completion(),config.clientDeadlineMs());
+                if(!gate.admissionOpen() || storageFault.get()!=null)
+                    return new MutationResult(Code.NOT_READY,0);
+                return new MutationResult(switch(completed.code()) {
+                    case OK -> Code.OK;
+                    case NO_QUORUM -> Code.NO_QUORUM;
+                    case NOT_READY -> Code.NOT_READY;
+                },completed.commitIndex());
+            }
+            case CLOSED, UNRESOLVED -> {return new MutationResult(Code.NOT_READY,0);}
+            case NEW -> { /* sole owner continues below */ }
+        }
+        try {
+            MutationResult result=mutateOwned(requestId,command);
+            var visible=deduplicator.finish(decision.owner(),new RequestDeduplicator.Completion(
+                    switch(result.code()) {
+                        case OK -> RequestDeduplicator.CompletionCode.OK;
+                        case NO_QUORUM -> RequestDeduplicator.CompletionCode.NO_QUORUM;
+                        default -> RequestDeduplicator.CompletionCode.NOT_READY;
+                    },result.commitIndex()),result.code()==Code.NO_QUORUM || unresolvedSuffix);
+            return new MutationResult(switch(visible.code()) {
+                case OK -> Code.OK;
+                case NO_QUORUM -> Code.NO_QUORUM;
+                case NOT_READY -> Code.NOT_READY;
+            },visible.commitIndex());
+        }catch(IOException | RuntimeException | Error failure) {
+            deduplicator.finish(decision.owner(),
+                    new RequestDeduplicator.Completion(RequestDeduplicator.CompletionCode.NOT_READY,0),
+                    unresolvedSuffix);
+            throw failure;
+        }
+    }
+
+    private MutationResult mutateOwned(String requestId,Command command) throws IOException {
         var permit=gate.tryAcquire();
         if(permit==null) return new MutationResult(Code.NOT_READY,0);
         try(permit) {
-            if(storageFault.get()!=null || unresolvedSuffix || admittedIds.contains(requestId))
+            if(storageFault.get()!=null || unresolvedSuffix)
                 return new MutationResult(Code.NOT_READY,0);
             // Bound fresh-prefix probes independently of any pre-append reservation wait.
             // Local catch-up slot contention must not consume the post-ENTRY ACK budget.
@@ -138,7 +187,6 @@ public final class LeaderCoordinator {
                     throw new IOException("leader has unresolved or inconsistent WAL prefix");
                 long next=previous+1;
                 // Record before WAL I/O so even an uncertain persisted outcome cannot be retried as new.
-                admittedIds.add(requestId);
                 LogEntry entry=new LogEntry(next,requestId,command,CanonicalCommandFingerprint.of(command));
                 log.append(entry); // leader ENTRY force(true)
                 localEntryDurable=true;
@@ -181,7 +229,7 @@ public final class LeaderCoordinator {
     private void latchFatal(IOException failure) {
         if(storageFault.compareAndSet(null,failure)) {
             unresolvedSuffix=true;
-            gate.closeAdmission();
+            closeAdmission();
             recordFault.accept(failure); // never acquire NodeServer lifecycle monitor here
         }
     }
