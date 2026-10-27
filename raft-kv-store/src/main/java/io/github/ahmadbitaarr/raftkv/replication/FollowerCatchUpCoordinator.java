@@ -12,6 +12,7 @@ import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
+import java.util.function.Consumer;
 
 /** Bounded periodic follower repair. No leader COMMIT, suffix-barrier changes, or quorum decisions. */
 public final class FollowerCatchUpCoordinator implements AutoCloseable {
@@ -23,6 +24,7 @@ public final class FollowerCatchUpCoordinator implements AutoCloseable {
     private final FollowerMaintenanceClient client;
     private final AckTracker tracker;
     private final BooleanSupplier unresolvedLeaderSuffix;
+    private final Consumer<IOException> committedHistoryFault;
     private final ScheduledThreadPoolExecutor scheduler;
     private final Map<String,AtomicBoolean> scheduled=new HashMap<>();
     private final ConcurrentMap<String,String> diagnostics=new ConcurrentHashMap<>();
@@ -35,6 +37,15 @@ public final class FollowerCatchUpCoordinator implements AutoCloseable {
             Supplier<NodeStatusSnapshot> leaderStatus,
             ReplicationManager manager,FollowerMaintenanceClient client,AckTracker tracker,
             BooleanSupplier unresolvedLeaderSuffix) {
+        this(config,log,leaderStatus,manager,client,tracker,unresolvedLeaderSuffix,ignored->{});
+    }
+
+    /** Phase 10 recovered-leader authority faults use the existing NodeServer fail-closed path. */
+    public FollowerCatchUpCoordinator(ClusterConfig config,WalBackedPersistentLog log,
+            Supplier<NodeStatusSnapshot> leaderStatus,
+            ReplicationManager manager,FollowerMaintenanceClient client,AckTracker tracker,
+            BooleanSupplier unresolvedLeaderSuffix,Consumer<IOException> committedHistoryFault) {
+        this.committedHistoryFault=Objects.requireNonNull(committedHistoryFault);
         this.config=Objects.requireNonNull(config);this.log=Objects.requireNonNull(log);
         this.leaderStatus=Objects.requireNonNull(leaderStatus);this.manager=Objects.requireNonNull(manager);
         this.client=Objects.requireNonNull(client);this.tracker=Objects.requireNonNull(tracker);
@@ -86,6 +97,12 @@ public final class FollowerCatchUpCoordinator implements AutoCloseable {
         diagnostics.put(follower,"UNSAFE: "+reason);
     }
 
+    private void committedContradiction(String follower,String reason) {
+        markUnsafe(follower,reason);
+        committedHistoryFault.accept(new IOException("confirmed follower committed-history mismatch: "
+                +follower+": "+reason));
+    }
+
     private void runSession(String follower){
         if(closing.get() || unsafe.contains(follower))return;
         // Status, replication, commit and truncation all use the SAME per-peer active slot.
@@ -124,7 +141,7 @@ public final class FollowerCatchUpCoordinator implements AutoCloseable {
             authoritative=refreshed;
             leaderCommit=authoritative.durableCommitIndex();
             if(status.commitIndex()>leaderCommit) {
-                markUnsafe(follower,"follower committed beyond leader");return;
+                committedContradiction(follower,"follower committed beyond leader");return;
             }
         }
         long known=tracker.verifiedMatchingThrough(follower);
@@ -157,7 +174,7 @@ public final class FollowerCatchUpCoordinator implements AutoCloseable {
                 }
                 if(outcome.kind()==FollowerClient.Kind.INDEX_CONFLICT) {
                     if(entry.index()<=status.commitIndex() || known<status.commitIndex()) {
-                        markUnsafe(follower,"committed-prefix conflict at "+entry.index());return;
+                        committedContradiction(follower,"committed-prefix conflict at "+entry.index());return;
                     }
                     // Only the verified retained prefix may survive; never truncate leader history.
                     if(known!=entry.index()-1 || known<status.appliedIndex()

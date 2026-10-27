@@ -19,11 +19,29 @@ class NodeServerTest {
   try(var n=node("n1",dir)){n.start();assertEquals(NodeLifecycleState.READY,n.statusSnapshot().state());assertTrue(n.statusSnapshot().ready());}
   try(var n=node("n2",dir.resolve("follower"))){n.start();assertEquals(NodeLifecycleState.CONTROL_ONLY,n.statusSnapshot().state());assertFalse(n.statusSnapshot().ready());}
  }
- @Test void committedWalStartsInControlOnlyNotReady()throws Exception{wal(dir,true);try(var n=node("n1",dir)){n.start();assertEquals(1,n.statusSnapshot().durableCommitIndex());assertEquals(0,n.statusSnapshot().appliedIndex());assertFalse(n.statusSnapshot().ready());}}
- @Test void uncommittedWalStartsInControlOnlyNotReady()throws Exception{wal(dir,false);try(var n=node("n1",dir)){n.start();assertEquals(1,n.statusSnapshot().lastLogIndex());assertEquals(0,n.statusSnapshot().durableCommitIndex());}}
+ @Test void previouslyOpenedEmptyWalRequiresRecoveryWitness() throws Exception {
+  // Physical emptiness is not proof that the WAL never held an uncommitted ENTRY.
+  Path path=dir.resolve("raftkv.wal");
+  try(var wal=FileWalStore.open(path)) {
+   assertEquals(0,wal.lastDurableLogIndex());
+   assertEquals(0,wal.durableCommitIndex());
+  }
+  assertTrue(Files.exists(path));
+  try(var n=node("n1",dir)) {
+   n.start();
+   var status=n.statusSnapshot();
+   assertEquals(NodeLifecycleState.CONTROL_ONLY,status.state());
+   assertFalse(status.ready(),"an existing empty WAL still requires a verified follower witness");
+   assertEquals(0,status.lastLogIndex());
+   assertEquals(0,status.durableCommitIndex());
+   assertEquals(0,status.appliedIndex());
+  }
+ }
+ @Test void committedWalStartsInControlOnlyNotReady()throws Exception{wal(dir,true);try(var n=node("n1",dir)){n.start();assertEquals(1,n.statusSnapshot().durableCommitIndex());assertEquals(1,n.statusSnapshot().appliedIndex());assertEquals(NodeLifecycleState.CONTROL_ONLY,n.statusSnapshot().state());assertFalse(n.statusSnapshot().ready());}}
+ @Test void uncommittedWalStartsInControlOnlyNotReady()throws Exception{wal(dir,false);try(var n=node("n1",dir)){n.start();assertEquals(0,n.statusSnapshot().lastLogIndex());assertEquals(0,n.statusSnapshot().durableCommitIndex());assertEquals(0,n.statusSnapshot().appliedIndex());assertEquals(NodeLifecycleState.CONTROL_ONLY,n.statusSnapshot().state());assertFalse(n.statusSnapshot().ready());}}
  @Test void startupRecoversWalBeforeBinding()throws Exception{wal(dir,true);try(var n=node("n1",dir)){assertEquals(NodeLifecycleState.NEW,n.statusSnapshot().state());n.start();assertEquals(1,n.statusSnapshot().lastLogIndex());assertTrue(n.boundPort()>0);}}
  @Test void startupRecoversActualDurableStatusIndexes()throws Exception{wal(dir,true);try(var n=node("n2",dir)){n.start();assertEquals(1,n.statusSnapshot().lastLogIndex());assertEquals(1,n.statusSnapshot().durableCommitIndex());}}
- @Test void startupNeverAppliesCommands()throws Exception{wal(dir,true);try(var n=node("n1",dir)){n.start();assertEquals(0,n.statusSnapshot().appliedIndex());}}
+ @Test void recoveredLeaderReplaysCommittedCommandsWithoutPrematureReadiness()throws Exception{wal(dir,true);try(var n=node("n1",dir)){n.start();assertEquals(1,n.statusSnapshot().appliedIndex());assertEquals(1,n.statusSnapshot().durableCommitIndex());assertEquals(NodeLifecycleState.CONTROL_ONLY,n.statusSnapshot().state());assertFalse(n.statusSnapshot().ready());}}
  @Test void corruptWalPreventsListenerBinding()throws Exception{Files.write(dir.resolve("raftkv.wal"),new byte[15]);try(var n=node("n1",dir)){assertThrows(IOException.class,n::start);assertEquals(NodeLifecycleState.FAILED,n.statusSnapshot().state());assertEquals(-1,n.boundPort());}}
  @Test void portConflictCleansUpWalAndLease()throws Exception{
   Path firstDir=dir.resolve("owner"),secondDir=dir.resolve("contender");

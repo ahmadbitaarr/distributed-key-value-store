@@ -247,7 +247,7 @@ class Phase7RealThreeNodeTest {
         }
     }
 
-    @Test void recoveredCommittedLeaderCannotResumeWritingWithoutPhase10() throws Exception {
+    @Test void recoveredCommittedLeaderWithoutFollowerWitnessCannotResumeWriting() throws Exception {
         var c1=config("n1");var c2=config("n2");var live=new java.util.concurrent.ConcurrentHashMap<String,NodeEndpoint>();
         try(var n2=follower(c2);var leader=leader(c1,live)) {
             n2.start();register(live,"n2",n2);leader.start();var ch=channel(leader);
@@ -259,7 +259,7 @@ class Phase7RealThreeNodeTest {
             try {
                 assertEquals(ResultCode.RESULT_CODE_NOT_READY,put(ch,"second","x",new byte[]{2}).getCode());
                 assertEquals(1,restarted.statusSnapshot().durableCommitIndex());
-                assertEquals(0,restarted.statusSnapshot().appliedIndex());
+                assertEquals(1,restarted.statusSnapshot().appliedIndex()); // Phase 10 local replay, still not READY
             } finally {ch.shutdownNow();}
         }
     }

@@ -5,6 +5,7 @@ import io.github.ahmadbitaarr.raftkv.commit.CommitManager;
 import io.github.ahmadbitaarr.raftkv.config.ClusterConfig;
 import io.github.ahmadbitaarr.raftkv.log.*;
 import io.github.ahmadbitaarr.raftkv.replication.*;
+import io.github.ahmadbitaarr.raftkv.recovery.RecoveryManager;
 import io.github.ahmadbitaarr.raftkv.server.NodeRole;
 import io.github.ahmadbitaarr.raftkv.statemachine.StateMachineApplier;
 import io.github.ahmadbitaarr.raftkv.wal.WalStore;
@@ -59,11 +60,35 @@ public final class LeaderCoordinator {
         freshAtStartup=log.lastLogIndex()==0 && wal.lastDurableLogIndex()==0 && wal.durableCommitIndex()==0;
     }
 
-    /** Called by NodeServer after gRPC startup; recovered nonempty leader never enables writes. */
+    /** Called only for the original empty-WAL startup, not after tail canonicalization. */
     public void openAfterStartup() {if(freshAtStartup)gate.open();}
+
+    /** Recovered nonempty startup: no arbitrary boolean or unverified high-water mark can open writes. */
+    public void openAfterVerifiedRecovery(RecoveryManager.Certificate certificate) {
+        if(certificate==null || !certificate.validFor(log,wal,applier) || unresolvedSuffix
+                || storageFault.get()!=null || gate.isActive())
+            throw new IllegalStateException("invalid recovered-leader write authorization");
+        for(long index=1;index<=wal.durableCommitIndex();index++) {
+            var entry=log.get(index).orElseThrow();
+            admittedIds.add(entry.requestId()); // interim safety guard; not full Phase 11 dedup
+        }
+        gate.open();
+    }
     public void closeAdmission() {gate.closeAdmission();}
     public boolean hasUnresolvedSuffix(){return unresolvedSuffix;}
     public IOException storageFailure(){return storageFault.get();}
+    /** A proven recovered-cluster authority violation also closes an active leader writer. */
+    public void failExternally(IOException failure) {
+        Objects.requireNonNull(failure);
+        if(storageFault.compareAndSet(null,failure)) {
+            unresolvedSuffix=true;
+            gate.closeAdmission();
+        }
+    }
+    private void requireNoExternalFailure() throws IOException {
+        IOException failure=storageFault.get();
+        if(failure!=null)throw new IOException("leader admission invalidated by fatal storage/authority failure",failure);
+    }
     public boolean isActive(){return gate.isActive();}
     public boolean awaitDrained(long timeout, TimeUnit unit) throws InterruptedException {
         return gate.awaitDrained(timeout,unit);
@@ -125,15 +150,18 @@ public final class LeaderCoordinator {
                 for(var accepted:outcomes.outcomes().entrySet()) {
                     tracker.recordDurableAck(accepted.getKey(),entry,accepted.getValue());
                 }
+                requireNoExternalFailure();
                 Optional<AckTracker.MajorityCertificate> majority=tracker.majorityFor(entry);
                 if(majority.isEmpty()) {
                     unresolvedSuffix=true; // permanent Phase 7 barrier, even if late ACK appears
                     return new MutationResult(Code.NO_QUORUM,0);
                 }
+                requireNoExternalFailure();
                 commit.commit(entry,majority.orElseThrow()); // durable force + commit snapshot publication
                 long applied=applier.applyThrough(next,wal.durableCommitIndex(),log);
                 if(applied<next)throw new IllegalStateException("committed entry not applied");
                 publishAppliedIndex.accept(applied);
+                requireNoExternalFailure(); // never return OK after a confirmed concurrent authority fault
                 try { committedWakeup.run(); } catch(RuntimeException ignored) { /* advisory only */ }
                 return new MutationResult(Code.OK,next);
             } catch(IOException failure) {

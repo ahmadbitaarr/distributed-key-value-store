@@ -13,6 +13,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.*;
 
 class Phase7LeaderShutdownTest {
@@ -41,14 +42,23 @@ class Phase7LeaderShutdownTest {
     }
     @Test void shutdownTimeoutPreservesWalLeaseDuringBlockedLeaderForceAndCancelledCall()throws Exception {
         var config=config(40);
-        var store=new BlockEntryWal(FileWalStore.open(config.walFile()));
+        // Open through NodeServer only after its pre-open WAL provenance check.
+        // Pre-opening here would make a fresh WAL look like recovery history.
+        var openedStore=new AtomicReference<BlockEntryWal>();
         var node=new NodeServer(config,0,(cfg,port,client,replication)->NettyServerBuilder
                 .forPort(port).maxInboundMessageSize(cfg.maxInboundMessageBytes())
-                .addService(client).addService(replication).build(),path->store);
+                .addService(client).addService(replication).build(),path->{
+                    var store=new BlockEntryWal(FileWalStore.open(path));
+                    openedStore.set(store);
+                    return store;
+                });
         ExecutorService pool=Executors.newSingleThreadExecutor();
         ManagedChannel channel=null;
         try {
-            node.start();channel=ManagedChannelBuilder.forAddress("127.0.0.1",node.boundPort()).usePlaintext().build();
+            node.start();
+            var store=Objects.requireNonNull(openedStore.get(),"WAL opener not invoked");
+            assertEquals(NodeLifecycleState.READY,node.statusSnapshot().state());
+            channel=ManagedChannelBuilder.forAddress("127.0.0.1",node.boundPort()).usePlaintext().build();
             ManagedChannel actualChannel=channel;
             Future<?> call=pool.submit(()->KeyValueServiceGrpc.newBlockingStub(actualChannel)
                     .withDeadlineAfter(5,TimeUnit.SECONDS).put(PutRequest.newBuilder()
@@ -72,7 +82,8 @@ class Phase7LeaderShutdownTest {
             if(last!=null)throw last;
             try(var lease=WalDirectoryLease.acquire(dir)){assertTrue(lease.isHeld());}
         }finally {
-            store.release.countDown();
+            var store=openedStore.get();
+            if(store!=null)store.release.countDown();
             if(channel!=null)channel.shutdownNow();
             pool.shutdownNow();
             if(node.statusSnapshot().state()!=NodeLifecycleState.STOPPED)try{node.close();}catch(IOException ignored){}

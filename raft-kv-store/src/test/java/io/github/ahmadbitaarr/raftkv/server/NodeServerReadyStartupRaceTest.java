@@ -135,9 +135,11 @@ class NodeServerReadyStartupRaceTest {
                 leader.start();
                 assertEquals(NodeLifecycleState.CONTROL_ONLY,leader.statusSnapshot().state());
                 assertFalse(leader.statusSnapshot().ready());
-                assertEquals(1,leader.statusSnapshot().lastLogIndex());
+                assertEquals(committed?1:0,leader.statusSnapshot().lastLogIndex());
                 assertEquals(committed?1:0,leader.statusSnapshot().durableCommitIndex());
-                assertEquals(0,leader.statusSnapshot().appliedIndex());
+                assertEquals(committed?1:0,leader.statusSnapshot().appliedIndex());
+                assertFalse(leader.statusSnapshot().ready(),
+                        "local WAL recovery alone must not authorize client data readiness");
                 ManagedChannel channel=channel(leader.boundPort());
                 try {
                     assertEquals(ResultCode.RESULT_CODE_NOT_READY,get(channel,"key").getCode());

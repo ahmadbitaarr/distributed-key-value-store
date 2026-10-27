@@ -48,5 +48,38 @@ class NodeLoopbackGrpcTest {
  }
  @Test void stoppedServerRejectsNewCalls()throws Exception{var n=node("n1");int p=n.boundPort();n.close();var c=channel(p);try{assertThrows(StatusRuntimeException.class,()->client(c).get(GetRequest.newBuilder().setKey("k").build()));}finally{c.shutdownNow();}}
  @Test void bindConflictFailsWithoutDamagingOriginalWal()throws Exception{try(var n=node("n1")){try(var dup=new NodeServer(ClusterConfigTest.config(dir,"n1"),n.boundPort())){assertThrows(Exception.class,dup::start);}}}
- @Test void reopenAfterShutdownPreservesRecoveredWalMetadata()throws Exception{try(var store=FileWalStore.open(dir.resolve("raftkv.wal"))){store.appendEntryDurably(new LogEntry(1,"r",Command.delete("x"),new byte[]{2}));}try(var n=node("n1")){assertEquals(1,n.statusSnapshot().lastLogIndex());}try(var n=node("n1")){assertEquals(1,n.statusSnapshot().lastLogIndex());}}
+ @Test void reopenAfterShutdownPreservesRecoveredWalMetadata() throws Exception {
+  try(var store=FileWalStore.open(dir.resolve("raftkv.wal"))) {
+   store.appendEntryDurably(new LogEntry(1,"r",Command.delete("x"),new byte[]{2}));
+  }
+  // First restart canonicalizes the uncommitted WAL to zero but cannot open data admission.
+  try(var n=node("n1")) {
+   assertEquals(0,n.statusSnapshot().lastLogIndex());
+   assertEquals(0,n.statusSnapshot().durableCommitIndex());
+   assertEquals(NodeLifecycleState.CONTROL_ONLY,n.statusSnapshot().state());
+   assertFalse(n.statusSnapshot().ready());
+  }
+  // On the next restart the WAL is EMPTY BUT PREEXISTING: still not a new cluster.
+  try(var n=node("n1")) {
+   assertEquals(0,n.statusSnapshot().lastLogIndex());
+   assertEquals(0,n.statusSnapshot().durableCommitIndex());
+   assertEquals(0,n.statusSnapshot().appliedIndex());
+   assertEquals(NodeLifecycleState.CONTROL_ONLY,n.statusSnapshot().state());
+   assertFalse(n.statusSnapshot().ready());
+   var c=channel(n.boundPort());
+   try {
+    var get=client(c).get(GetRequest.newBuilder().setKey("x").build());
+    assertEquals(ResultCode.RESULT_CODE_NOT_READY,get.getCode());
+    assertFalse(get.hasCommitIndex());
+    var put=client(c).put(PutRequest.newBuilder().setRequestId("retry-r")
+      .setKey("x").setValue(ByteString.copyFromUtf8("new")).build());
+    assertEquals(ResultCode.RESULT_CODE_NOT_READY,put.getCode());
+    assertFalse(put.hasCommitIndex());
+   } finally {c.shutdownNow();}
+  }
+  try(var wal=FileWalStore.open(dir.resolve("raftkv.wal"))) {
+   assertEquals(0,wal.lastDurableLogIndex());
+   assertEquals(0,wal.durableCommitIndex());
+  }
+ }
 }

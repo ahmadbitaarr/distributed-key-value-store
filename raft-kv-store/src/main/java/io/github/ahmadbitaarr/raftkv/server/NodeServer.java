@@ -10,6 +10,7 @@ import io.github.ahmadbitaarr.raftkv.replication.ReplicationOperationGate;
 import io.github.ahmadbitaarr.raftkv.replication.GrpcFollowerClient;
 import io.github.ahmadbitaarr.raftkv.replication.ReplicationManager;
 import io.github.ahmadbitaarr.raftkv.replication.FollowerCatchUpCoordinator;
+import io.github.ahmadbitaarr.raftkv.recovery.RecoveryManager;
 import io.github.ahmadbitaarr.raftkv.commit.AckTracker;
 import io.github.ahmadbitaarr.raftkv.commit.CommitManager;
 import io.github.ahmadbitaarr.raftkv.leader.LeaderCoordinator;
@@ -52,6 +53,10 @@ public final class NodeServer implements AutoCloseable {
     private StateMachineApplier followerApplier;
     private FollowerCatchUpCoordinator leaderCatchUp;
     private LeaderReadCoordinator leaderReads;
+    private RecoveryManager recoveryManager;
+    /** Independent of the synchronized NodeServer lifetime monitor: worker callbacks never need it. */
+    private final Object recoveryActivationLock=new Object();
+    private boolean recoveryActivationClosed;
 
     public NodeServer(ClusterConfig config){this(config,-1,NodeServer::buildNetty,FileWalStore::open);}
     NodeServer(ClusterConfig config,int testPortOverride){this(config,testPortOverride,NodeServer::buildNetty,FileWalStore::open);}
@@ -93,6 +98,7 @@ public final class NodeServer implements AutoCloseable {
     LeaderCoordinator leaderCoordinatorForTest(){return leaderCoordinator;}
     StateMachineApplier readApplierForTest(){return leaderApplier;}
     StateMachineApplier followerApplierForTest(){return followerApplier;}
+    RecoveryManager recoveryManagerForTest(){return recoveryManager;}
     public synchronized int boundPort(){return server!=null && !server.isShutdown()?server.getPort():-1;}
 
     public synchronized void start() throws IOException {
@@ -102,12 +108,17 @@ public final class NodeServer implements AutoCloseable {
             transition(NodeLifecycleState.STARTING);
             lease=WalDirectoryLease.acquire(config.walDirectory());
             transition(NodeLifecycleState.RECOVERING);
+            // A preexisting zero-length WAL can be the durable result of truncating an
+            // unresolved leader tail. Only an ABSENT WAL proves a fresh initialization.
+            // Unknown filesystem state also fails closed (Files.notExists returns false).
+            final boolean walAbsentBeforeOpen=java.nio.file.Files.notExists(
+                    config.walFile(),java.nio.file.LinkOption.NOFOLLOW_LINKS);
             WalStore store=walOpener.open(config.walFile());
             log=new WalBackedPersistentLog(store); // one opened WAL; single owner
             WalRecoveryResult recovery=store.recoveryResult();
             // Capture READY eligibility from recovered WAL BEFORE opening mutation admission.
             final boolean freshLeaderAtRecovery=config.localRole()==NodeRole.LEADER
-                    && recovery.entries().isEmpty() && recovery.commitIndex()==0;
+                    && walAbsentBeforeOpen && recovery.entries().isEmpty() && recovery.commitIndex()==0;
             published.set(new NodeStatusSnapshot(config.localNodeId(),config.localRole(),
                     NodeLifecycleState.RECOVERING,recovery.entries().size(),recovery.commitIndex(),0,false));
             // Phase 9 narrowly replays follower-only committed history before any RPC admission.
@@ -130,15 +141,29 @@ public final class NodeServer implements AutoCloseable {
                 var tracker=new AckTracker(config,log,store);
                 var committer=new CommitManager(tracker,store,log,this::publishCommitIndex);
                 leaderApplier=new StateMachineApplier(new KvStateMachine());
-                if(leaderApplier.appliedIndex()!=0)
-                    throw new IOException("leader state machine is not empty at startup");
+                if(!freshLeaderAtRecovery) {
+                    // Canonicalize the one owned leader WAL before any listener or data gate opens.
+                    // Both metadata and replay are published as one immutable not-ready snapshot.
+                    var local=RecoveryManager.recoverLocal(log,store,leaderApplier);
+                    published.set(new NodeStatusSnapshot(config.localNodeId(),config.localRole(),
+                            NodeLifecycleState.RECOVERING,local.committedIndex(),
+                            local.committedIndex(),local.appliedIndex(),false));
+                }
+                if(leaderApplier.appliedIndex()!=store.durableCommitIndex())
+                    throw new IOException("leader replay/application progress mismatch");
                 leaderReads=new LeaderReadCoordinator(leaderApplier,this::readSnapshotForRead);
                 leaderCoordinator=new LeaderCoordinator(config,log,store,replicationManager,outgoing,
                         tracker,committer,leaderApplier,this::publishDurableIndex,
                         this::publishAppliedIndex,this::recordFatalStorageFailure);
                 leaderCatchUp=new FollowerCatchUpCoordinator(config,log,this::statusSnapshot,replicationManager,
-                        outgoing,tracker,leaderCoordinator::hasUnresolvedSuffix);
+                        outgoing,tracker,leaderCoordinator::hasUnresolvedSuffix,
+                        fault -> {if(!freshLeaderAtRecovery)recordFatalStorageFailure(fault);});
                 leaderCoordinator.setCommitWakeup(leaderCatchUp::wake);
+                if(!freshLeaderAtRecovery) {
+                    recoveryManager=new RecoveryManager(config,log,store,leaderApplier,
+                            replicationManager,outgoing,tracker,this::activateRecoveredLeader,
+                            this::recordFatalStorageFailure);
+                }
             }
             var client=new ClientKvGrpcService(config,this::statusSnapshot,leaderCoordinator,leaderReads);
             var peers=new ReplicationGrpcService(config,this::statusSnapshot,follower);
@@ -154,16 +179,22 @@ public final class NodeServer implements AutoCloseable {
                     leaderReads.openAfterStartup();
                     requireHealthyLeaderStartup();
                     transition(NodeLifecycleState.READY);
+                    requireHealthyLeaderStartup();
+                    // Existing fresh-leader rule: open writer LAST, after READY publication.
+                    leaderCoordinator.openAfterStartup();
+                    requireHealthyLeaderStartup();
+                    if(leaderCatchUp!=null)leaderCatchUp.start();
+                } else {
+                    // Only control RPCs are available. One independently verified follower
+                    // will authorize readiness asynchronously; no indefinite startup wait.
+                    recoveryManager.start();
                 }
-                requireHealthyLeaderStartup();
-                // Open write admission LAST: a first PUT cannot invalidate READY eligibility.
-                // Recovered nonempty leaders retain their closed write gate.
-                leaderCoordinator.openAfterStartup();
-                requireHealthyLeaderStartup();
-                // Recovered leader stays CONTROL_ONLY: do not start catch-up without an authoritative state.
-                if(freshLeaderAtRecovery && leaderCatchUp!=null)leaderCatchUp.start();
             }
         }catch(IOException | RuntimeException failure){
+            synchronized(recoveryActivationLock) {
+                recoveryActivationClosed=true;
+                if(recoveryManager!=null)recoveryManager.closeAdmission();
+            }
             replicationGate.closeAdmission();
             if(leaderReads!=null)leaderReads.closeAdmission();
             if(leaderCoordinator!=null)leaderCoordinator.closeAdmission();
@@ -171,6 +202,33 @@ public final class NodeServer implements AutoCloseable {
             try{releaseResourcesAfterTermination();}catch(IOException | RuntimeException cleanup){failure.addSuppressed(cleanup);}
             if(failure instanceof IOException io) throw io;
             throw new IOException("node startup failed",failure);
+        }
+    }
+
+    /** Recovery completion cannot race STOPPING; never acquires the NodeServer monitor. */
+    private void activateRecoveredLeader(RecoveryManager.Certificate certificate) {
+        synchronized(recoveryActivationLock) {
+            if(recoveryActivationClosed || storageFault.get()!=null || recoveryManager==null
+                    || !recoveryManager.accepts(certificate)
+                    || published.get().state()!=NodeLifecycleState.CONTROL_ONLY)
+                return;
+            try {
+                requireHealthyLeaderStartup();
+                leaderReads.openAfterStartup();
+                requireHealthyLeaderStartup();
+                if(recoveryActivationClosed || published.get().state()!=NodeLifecycleState.CONTROL_ONLY)
+                    return;
+                transition(NodeLifecycleState.READY);
+                requireHealthyLeaderStartup();
+                // A recovered-leader writer requires the issued, owner-bound certificate.
+                leaderCoordinator.openAfterVerifiedRecovery(certificate);
+                requireHealthyLeaderStartup();
+                leaderCatchUp.start();
+            } catch(IOException | RuntimeException failedActivation) {
+                IOException error=failedActivation instanceof IOException io ? io
+                        : new IOException("recovered leader activation failed",failedActivation);
+                recordFatalStorageFailure(error);
+            }
         }
     }
 
@@ -205,6 +263,8 @@ public final class NodeServer implements AutoCloseable {
     private void recordFatalStorageFailure(IOException failure){
         storageFault.compareAndSet(null,failure);
         if(leaderReads!=null)leaderReads.closeAdmission();
+        if(recoveryManager!=null)recoveryManager.closeAdmission();
+        if(leaderCoordinator!=null)leaderCoordinator.failExternally(failure);
         if(leaderCatchUp!=null)leaderCatchUp.closeAdmission();
         replicationGate.closeAdmission();
         published.updateAndGet(old->{
@@ -226,8 +286,12 @@ public final class NodeServer implements AutoCloseable {
     /** Shutdown must confirm BOTH gRPC termination AND all admitted storage operations exiting. */
     @Override public synchronized void close() throws IOException {
         if(statusSnapshot().state()==NodeLifecycleState.STOPPED)return;
-        transition(NodeLifecycleState.STOPPING);
-        if(leaderReads!=null)leaderReads.closeAdmission();
+        synchronized(recoveryActivationLock) {
+            recoveryActivationClosed=true;
+            transition(NodeLifecycleState.STOPPING);
+            if(recoveryManager!=null)recoveryManager.closeAdmission();
+            if(leaderReads!=null)leaderReads.closeAdmission();
+        }
         if(leaderCatchUp!=null)leaderCatchUp.closeAdmission();
         replicationGate.closeAdmission();
         if(leaderCoordinator!=null)leaderCoordinator.closeAdmission();
@@ -281,6 +345,10 @@ public final class NodeServer implements AutoCloseable {
                 Thread.currentThread().interrupt();
                 throw new IOException("interrupted awaiting leader mutation completion; WAL lease retained",interrupted);
             }
+        }
+        if(recoveryManager!=null) {
+            recoveryManager.close(); // bounded and confirmed before any outbound channel or WAL close
+            recoveryManager=null;
         }
         if(leaderCatchUp!=null) {
             leaderCatchUp.close(); // actual catch-up workers must exit before channels/WAL ownership ends
