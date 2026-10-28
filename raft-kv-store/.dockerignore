@@ -1,0 +1,13 @@
+.git
+.gitignore
+**/target
+**/.idea
+**/.vscode
+**/*.iml
+**/*.zip
+**/*.patch
+**/*.log
+**/docker-evidence
+src/test
+PHASE*_PLAN.md
+PHASE*_VERIFICATION.md

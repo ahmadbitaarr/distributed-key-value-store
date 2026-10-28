@@ -108,6 +108,12 @@ public final class ReplicationGrpcService extends ReplicationServiceGrpc.Replica
             ReplicationContractValidator.validate(request);
             requireConfiguredLeader(request.getLeaderId());
             var current=snapshot.get();
+            // A diagnostic status RPC is also used for follower container health.
+            // A terminal node must never appear healthy merely because its indexes are valid.
+            if (current.state()==io.github.ahmadbitaarr.raftkv.server.NodeLifecycleState.FAILED
+                    || current.state()==io.github.ahmadbitaarr.raftkv.server.NodeLifecycleState.STOPPING
+                    || current.state()==io.github.ahmadbitaarr.raftkv.server.NodeLifecycleState.STOPPED)
+                throw Status.FAILED_PRECONDITION.withDescription("node lifecycle is terminal").asRuntimeException();
             response=ReplicationStatusResponse.newBuilder().setNodeId(config.localNodeId())
                     .setRole(current.role()==NodeRole.LEADER?io.github.ahmadbitaarr.raftkv.rpc.generated.replication.v1.NodeRole.NODE_ROLE_LEADER:
                             io.github.ahmadbitaarr.raftkv.rpc.generated.replication.v1.NodeRole.NODE_ROLE_FOLLOWER)

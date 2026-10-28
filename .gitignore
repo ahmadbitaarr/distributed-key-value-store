@@ -1,2 +1,5 @@
 **/target/
 *.zip
+
+# Local Phase 12 container/deployment diagnostics
+/raft-kv-store/docker-evidence/

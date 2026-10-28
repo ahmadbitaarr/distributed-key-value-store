@@ -1,0 +1,65 @@
+name: raftkv
+x-common: &common
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: raftkv:phase12
+  restart: "no"
+  stop_grace_period: 75s
+  networks:
+    - cluster
+  environment:
+    RAFTKV_CONFIG: /etc/raftkv/node.properties
+  healthcheck:
+    interval: 5s
+    timeout: 5s
+    start_period: 15s
+    retries: 4
+
+services:
+  node-1:
+    <<: *common
+    hostname: node-1
+    ports:
+      - "127.0.0.1:50051:50051"
+    volumes:
+      - raftkv-node1-data:/var/lib/raftkv
+      - ./docker/config/node-1.properties:/etc/raftkv/node.properties:ro
+    healthcheck:
+      test: ["CMD", "java", "-cp", "/opt/raftkv/app.jar", "io.github.ahmadbitaarr.raftkv.server.DeploymentHealthProbe", "--role=leader", "--node=n1", "--leader=n1", "--port=50051"]
+      interval: 5s
+      timeout: 5s
+      start_period: 15s
+      retries: 4
+  node-2:
+    <<: *common
+    hostname: node-2
+    volumes:
+      - raftkv-node2-data:/var/lib/raftkv
+      - ./docker/config/node-2.properties:/etc/raftkv/node.properties:ro
+    healthcheck:
+      test: ["CMD", "java", "-cp", "/opt/raftkv/app.jar", "io.github.ahmadbitaarr.raftkv.server.DeploymentHealthProbe", "--role=follower", "--node=n2", "--leader=n1", "--port=50051"]
+      interval: 5s
+      timeout: 5s
+      start_period: 15s
+      retries: 4
+  node-3:
+    <<: *common
+    hostname: node-3
+    volumes:
+      - raftkv-node3-data:/var/lib/raftkv
+      - ./docker/config/node-3.properties:/etc/raftkv/node.properties:ro
+    healthcheck:
+      test: ["CMD", "java", "-cp", "/opt/raftkv/app.jar", "io.github.ahmadbitaarr.raftkv.server.DeploymentHealthProbe", "--role=follower", "--node=n3", "--leader=n1", "--port=50051"]
+      interval: 5s
+      timeout: 5s
+      start_period: 15s
+      retries: 4
+
+networks:
+  cluster:
+    driver: bridge
+volumes:
+  raftkv-node1-data:
+  raftkv-node2-data:
+  raftkv-node3-data:

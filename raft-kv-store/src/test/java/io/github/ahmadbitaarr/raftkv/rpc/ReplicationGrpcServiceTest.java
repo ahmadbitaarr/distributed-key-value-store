@@ -21,6 +21,22 @@ class ReplicationGrpcServiceTest {
  private Rig rig(String id,long last,long commit)throws Exception {var cfg=ClusterConfigTest.config(dir,id);var snap=new NodeStatusSnapshot(id,cfg.localRole(),NodeLifecycleState.CONTROL_ONLY,last,commit,0,false);return new Rig(new ReplicationGrpcService(cfg,()->snap));}
  private ReplicateEntryRequest replicate(){return ReplicateEntryRequest.newBuilder().setLeaderId("n1").setEntry(LogEntry.newBuilder().setIndex(1).setRequestId("request").setOperation(OperationType.OPERATION_TYPE_PUT).setKey("key").setValue(ByteString.EMPTY).setCommandFingerprint(ByteString.copyFromUtf8("x"))).build();}
  private ReplicationStatusRequest status(){return ReplicationStatusRequest.newBuilder().setLeaderId("n1").build();}
+ @Test void failedFollowerCannotAdvertiseHealthyReplicationStatus()throws Exception {
+  var cfg=ClusterConfigTest.config(dir,"n2");
+  var snap=new NodeStatusSnapshot("n2",cfg.localRole(),NodeLifecycleState.FAILED,2,1,1,false);
+  try(var r=new Rig(new ReplicationGrpcService(cfg,()->snap))){
+   var e=assertThrows(StatusRuntimeException.class,()->r.stub.getReplicationStatus(status()));
+   assertEquals(Status.Code.FAILED_PRECONDITION,e.getStatus().getCode());
+  }
+ }
+ @Test void stoppingFollowerCannotAdvertiseHealthyReplicationStatus()throws Exception {
+  var cfg=ClusterConfigTest.config(dir,"n2");
+  var snap=new NodeStatusSnapshot("n2",cfg.localRole(),NodeLifecycleState.STOPPING,2,1,1,false);
+  try(var r=new Rig(new ReplicationGrpcService(cfg,()->snap))){
+   var e=assertThrows(StatusRuntimeException.class,()->r.stub.getReplicationStatus(status()));
+   assertEquals(Status.Code.FAILED_PRECONDITION,e.getStatus().getCode());
+  }
+ }
  @Test void getReplicationStatusReportsConfiguredLeaderRole()throws Exception{try(var r=rig("n1",0,0)){assertEquals(NodeRole.NODE_ROLE_LEADER,r.stub.getReplicationStatus(status()).getRole());}}
  @Test void getReplicationStatusReportsFollowerRole()throws Exception{try(var r=rig("n2",0,0)){assertEquals(NodeRole.NODE_ROLE_FOLLOWER,r.stub.getReplicationStatus(status()).getRole());}}
  @Test void statusReportsDurableLogAndCommitButZeroApplied()throws Exception{try(var r=rig("n2",3,2)){var x=r.stub.getReplicationStatus(status());assertEquals(3,x.getLastLogIndex());assertEquals(2,x.getCommitIndex());assertEquals(0,x.getAppliedIndex());}}
